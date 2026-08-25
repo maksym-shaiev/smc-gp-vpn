@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""
+smc-vpn-refresh — refresh the VPN gateway cookie and reconnect.
+
+Usage:  smc-vpn-refresh [--browser chrome|firefox|auto] [--no-connect]
+
+Flow:
+  1. Load config from ~/.config/smc-gp-vpn/config
+  2. Run gpclient-smc --print-cookie --cookie-cache <cache>
+       - Reuses the cached portal-userauthcookie if still valid (no browser).
+       - Falls back to browser login when the portal session has expired.
+  3. Parse COOKIE= / HOST= from stdout.
+  4. Write cookie + gateway + gwcert='' to the NM profile via the NM
+     Python binding (gwcert='' satisfies need_secrets() without pinning).
+  5. Bring the VPN down then up again (unless --no-connect).
+
+Why not nmcli for secret writes:
+  The gateway authcookie contains '&' and '=' characters that nmcli's
+  comma-separated "key=value" format cannot represent unambiguously.
+  The NM GLib binding avoids this entirely.
+"""
+
+import argparse
+import os
+import sys
+import time
+import subprocess
+import gi
+
+gi.require_version("NM", "1.0")
+from gi.repository import NM, GLib  # noqa: E402
+
+CONFIG_PATH = os.path.expanduser("~/.config/smc-gp-vpn/config")
+
+CONNECT_UP_WAIT = 15  # seconds to wait for 'activated'
+
+
+# ── config ───────────────────────────────────────────────────────────────────
+
+def load_config(path: str) -> dict:
+    config = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                config[key.strip()] = os.path.expanduser(value.strip())
+    except FileNotFoundError:
+        die(f"Config not found: {path}\nRun install.sh first.")
+    return config
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def die(msg: str) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def pump_loop(ms: int = 700) -> None:
+    ml = GLib.MainLoop()
+    GLib.timeout_add(ms, ml.quit)
+    ml.run()
+
+
+# ── step 1 — get cookie ──────────────────────────────────────────────────────
+
+def get_cookie(config: dict, browser: str) -> tuple[str, str]:
+    """Run gpclient-smc --print-cookie and return (COOKIE, HOST)."""
+    gpclient = config.get("GPCLIENT_BIN",
+                          os.path.expanduser("~/.local/bin/gpclient-smc"))
+    cache    = config.get("CACHE",
+                          os.path.expanduser("~/.config/gpclient/smc-cookie.json"))
+    portal   = config.get("PORTAL", "us-access.stagwellglobal.com")
+
+    cmd = [
+        gpclient, "connect", portal,
+        "--browser", browser,
+        "--cookie-cache", cache,
+        "--print-cookie",
+    ]
+    print(f"[1/4] Running: {' '.join(cmd)}", flush=True)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        die(f"gpclient-smc not found at {gpclient}")
+    except subprocess.TimeoutExpired:
+        die("gpclient-smc timed out after 5 minutes")
+
+    cookie = host = ""
+    for line in result.stdout.splitlines():
+        if line.startswith("COOKIE="):
+            cookie = line[len("COOKIE="):]
+        elif line.startswith("HOST="):
+            host = line[len("HOST="):]
+
+    if result.returncode != 0 and not cookie:
+        print(result.stderr[-2000:], file=sys.stderr)
+        die(f"gpclient-smc exited {result.returncode} and returned no cookie")
+
+    if not cookie.startswith("authcookie="):
+        die(f"Unexpected cookie format (len={len(cookie)}): {cookie[:60]!r}")
+
+    if not host:
+        die("gpclient-smc returned no HOST")
+
+    print(f"    cookie length: {len(cookie)}  host: {host}", flush=True)
+    return cookie, host
+
+
+# ── step 2 — write NM secrets ────────────────────────────────────────────────
+
+def write_nm_secrets(config: dict, cookie: str, host: str) -> None:
+    """Write cookie / gateway / gwcert into the NM profile via D-Bus."""
+    conn_name = config.get("CONN_NAME", "SMC")
+    print(f"[2/4] Writing secrets to NetworkManager connection '{conn_name}' …",
+          flush=True)
+
+    client = NM.Client.new(None)
+    conn   = client.get_connection_by_id(conn_name)
+    if conn is None:
+        die(f"NetworkManager connection '{conn_name}' not found.\n"
+            f"Run install.sh to create it.")
+
+    s_vpn = conn.get_setting_vpn()
+    s_vpn.add_secret("cookie",  cookie)
+    s_vpn.add_secret("gateway", host)
+    # gwcert must be present (even empty) so that need_secrets() returns FALSE
+    # and NM skips the auth dialog. Empty → use --cafile (normal PKI), not
+    # --servercert (pinning), so the profile is immune to cert rotation.
+    s_vpn.add_secret("gwcert",  "")
+
+    conn.update2(
+        conn.to_dbus(NM.ConnectionSerializationFlags.ALL),
+        NM.SettingsUpdate2Flags.TO_DISK,
+        None, None, None,
+    )
+    pump_loop()
+    print("    secrets written to disk", flush=True)
+
+
+# ── step 3 — reconnect ───────────────────────────────────────────────────────
+
+def reconnect(config: dict) -> None:
+    conn_name = config.get("CONN_NAME", "SMC")
+    print(f"[3/4] Reconnecting '{conn_name}' …", flush=True)
+
+    # Down — ignore errors (connection may already be inactive)
+    subprocess.run(
+        ["nmcli", "connection", "down", conn_name],
+        capture_output=True,
+    )
+    time.sleep(1)
+
+    up = subprocess.run(
+        ["nmcli", "connection", "up", conn_name],
+        capture_output=True, text=True,
+    )
+    if up.returncode != 0:
+        print(up.stderr, file=sys.stderr)
+        die("nmcli connection up failed")
+
+    print(f"    waiting up to {CONNECT_UP_WAIT}s for 'activated' …", flush=True)
+    deadline = time.time() + CONNECT_UP_WAIT
+    while time.time() < deadline:
+        state = subprocess.run(
+            ["nmcli", "-t", "-f", "GENERAL.STATE",
+             "connection", "show", "--active", conn_name],
+            capture_output=True, text=True,
+        )
+        if "activated" in state.stdout.lower():
+            print("    activated", flush=True)
+            return
+        time.sleep(1)
+
+    die(f"'{conn_name}' did not reach 'activated' within {CONNECT_UP_WAIT}s")
+
+
+# ── step 4 — verify ──────────────────────────────────────────────────────────
+
+def verify() -> None:
+    print("[4/4] Verifying tunnel interface …", flush=True)
+    r = subprocess.run(
+        ["ip", "-br", "addr", "show", "type", "tun"],
+        capture_output=True, text=True,
+    )
+    print(f"    {r.stdout.strip() or '(no tun interface found)'}", flush=True)
+    print("Done.", flush=True)
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Refresh the VPN gateway cookie and reconnect via NetworkManager."
+    )
+    parser.add_argument(
+        "--browser",
+        default=None,
+        choices=["chrome", "firefox", "auto"],
+        help="Browser for CAS login when the portal session has expired "
+             "(default: value from config, fallback: chrome)",
+    )
+    parser.add_argument(
+        "--no-connect",
+        action="store_true",
+        help="Update secrets only; do not bring the VPN up",
+    )
+    parser.add_argument(
+        "--config",
+        default=CONFIG_PATH,
+        help=f"Path to config file (default: {CONFIG_PATH})",
+    )
+    args = parser.parse_args()
+
+    config  = load_config(args.config)
+    browser = args.browser or config.get("BROWSER", "chrome")
+
+    cookie, host = get_cookie(config, browser)
+    write_nm_secrets(config, cookie, host)
+
+    if args.no_connect:
+        print("Secrets updated. Skipping reconnect (--no-connect).", flush=True)
+    else:
+        reconnect(config)
+        verify()
+
+
+if __name__ == "__main__":
+    main()

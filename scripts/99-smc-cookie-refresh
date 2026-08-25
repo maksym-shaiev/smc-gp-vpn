@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""
+99-smc-cookie-refresh — NM dispatcher script.
+
+NetworkManager calls dispatcher scripts as:
+    <script> <interface> <action>
+
+with environment variables CONNECTION_UUID, CONNECTION_ID, etc.
+
+Strategy: when the configured VPN goes down, mint a fresh gateway
+cookie (using the still-valid portal-userauthcookie from the cache)
+and write it back to the NM profile so the next toggle-on works
+without user intervention.
+
+If the portal session has also expired (browser login required), send
+a desktop notification and exit cleanly — the toggle-on will fail and
+the user must run `smc-vpn-refresh` manually.
+
+NM waits for dispatcher scripts on vpn-pre-up/pre-down but NOT on
+vpn-down. This script runs in the background on vpn-down (no-wait
+semantics). That is fine: we only need to finish before the next
+manual toggle-on attempt.
+
+Configuration is read from ~/.config/smc-gp-vpn/config, written by
+install.sh. All previously hardcoded values (username, UID, portal,
+connection name) are derived at runtime.
+"""
+
+import os
+import sys
+import glob
+import subprocess
+import syslog
+import gi
+
+gi.require_version("NM", "1.0")
+from gi.repository import NM, GLib  # noqa: E402
+
+# ── config ───────────────────────────────────────────────────────────────────
+
+def load_config(path: str) -> dict:
+    config = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                config[key.strip()] = os.path.expanduser(value.strip())
+    except FileNotFoundError:
+        pass
+    return config
+
+
+def find_config() -> tuple[str, dict]:
+    """
+    Find the config file for the invoking user.
+
+    The dispatcher runs as root. We locate the config by iterating
+    over active login sessions (via /run/user/<uid>/bus) and checking
+    which user owns a smc-gp-vpn config.
+    """
+    for bus_path in glob.glob("/run/user/*/bus"):
+        uid = int(bus_path.split("/")[3])
+        try:
+            pw = __import__("pwd").getpwuid(uid)
+        except KeyError:
+            continue
+        config_path = os.path.join(pw.pw_dir, ".config", "smc-gp-vpn", "config")
+        if os.path.exists(config_path):
+            return config_path, load_config(config_path), pw
+    return "", {}, None
+
+
+# ── logging / notification ───────────────────────────────────────────────────
+
+LOG_TAG = "smc-cookie-refresh"
+
+
+def log(msg: str) -> None:
+    syslog.openlog(LOG_TAG, syslog.LOG_PID, syslog.LOG_DAEMON)
+    syslog.syslog(syslog.LOG_INFO, msg)
+    syslog.closelog()
+
+
+def notify(pw, summary: str, body: str) -> None:
+    """Send a desktop notification to the real user's session."""
+    uid = pw.pw_uid
+    dbus_addr = f"unix:path=/run/user/{uid}/bus"
+    env = os.environ.copy()
+    env["DBUS_SESSION_BUS_ADDRESS"] = dbus_addr
+    env["DISPLAY"] = ":0"
+    try:
+        subprocess.run(
+            ["sudo", "-u", pw.pw_name, "notify-send",
+             "--urgency=normal", "--icon=network-vpn",
+             summary, body],
+            env=env, timeout=5, capture_output=True,
+        )
+    except Exception:
+        pass  # notification is best-effort
+
+
+# ── cookie refresh ───────────────────────────────────────────────────────────
+
+def get_fresh_cookie(config: dict, pw) -> tuple[str, str] | None:
+    """
+    Run gpclient-smc --print-cookie as the real user.
+    Returns (COOKIE, HOST) or None if the portal session has expired.
+    """
+    gpclient = config.get("GPCLIENT_BIN",
+                          os.path.join(pw.pw_dir, ".local", "bin", "gpclient-smc"))
+    cache    = config.get("CACHE",
+                          os.path.join(pw.pw_dir, ".config", "gpclient", "smc-cookie.json"))
+    portal   = config.get("PORTAL", "us-access.stagwellglobal.com")
+    browser  = config.get("BROWSER", "chrome")
+
+    cmd = [
+        "sudo", "-u", pw.pw_name,
+        gpclient, "connect", portal,
+        "--browser", browser,
+        "--cookie-cache", cache,
+        "--print-cookie",
+    ]
+    env = os.environ.copy()
+    env["HOME"] = pw.pw_dir
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{pw.pw_uid}/bus"
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        log("gpclient-smc timed out — portal session may have expired")
+        return None
+    except Exception as e:
+        log(f"gpclient-smc failed to start: {e}")
+        return None
+
+    cookie = host = ""
+    for line in result.stdout.splitlines():
+        if line.startswith("COOKIE="):
+            cookie = line[len("COOKIE="):]
+        elif line.startswith("HOST="):
+            host = line[len("HOST="):]
+
+    if not cookie.startswith("authcookie=") or not host:
+        log(
+            f"gpclient-smc returned no usable cookie "
+            f"(exit={result.returncode}); portal session likely expired"
+        )
+        return None
+
+    return cookie, host
+
+
+# ── NM secret write ──────────────────────────────────────────────────────────
+
+def write_nm_secrets(conn_name: str, cookie: str, host: str) -> None:
+    client = NM.Client.new(None)
+    conn   = client.get_connection_by_id(conn_name)
+    if conn is None:
+        log(f"NM connection '{conn_name}' not found — skipping secret write")
+        return
+
+    s_vpn = conn.get_setting_vpn()
+    s_vpn.add_secret("cookie",  cookie)
+    s_vpn.add_secret("gateway", host)
+    s_vpn.add_secret("gwcert",  "")
+
+    conn.update2(
+        conn.to_dbus(NM.ConnectionSerializationFlags.ALL),
+        NM.SettingsUpdate2Flags.TO_DISK,
+        None, None, None,
+    )
+    ml = GLib.MainLoop()
+    GLib.timeout_add(700, ml.quit)
+    ml.run()
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        sys.exit(0)
+
+    action    = sys.argv[2]
+    conn_uuid = os.environ.get("CONNECTION_UUID", "")
+    conn_id   = os.environ.get("CONNECTION_ID",   "")
+    iface     = sys.argv[1]
+
+    # Locate the config and resolve the real user
+    config_path, config, pw = find_config()
+    if pw is None:
+        # No smc-gp-vpn config found for any logged-in user — not our VPN
+        sys.exit(0)
+
+    conn_name = config.get("CONN_NAME", "SMC")
+
+    # Only act when our specific connection goes down
+    if conn_id != conn_name and conn_uuid != _get_uuid(conn_name):
+        sys.exit(0)
+    if action != "vpn-down":
+        sys.exit(0)
+
+    log(f"{conn_name} vpn-down on {iface} — refreshing gateway cookie")
+
+    result = get_fresh_cookie(config, pw)
+    if result is None:
+        log(f"Portal session expired — manual `smc-vpn-refresh` required")
+        notify(
+            pw,
+            f"{conn_name} VPN — re-authentication required",
+            "The portal session has expired. Run `smc-vpn-refresh` to log in again.",
+        )
+        sys.exit(0)
+
+    cookie, host = result
+    write_nm_secrets(conn_name, cookie, host)
+    log(f"Gateway cookie refreshed (len={len(cookie)}) — {conn_name} toggle ready")
+
+
+def _get_uuid(conn_name: str) -> str:
+    """Look up the UUID of a NM connection by name (best-effort)."""
+    try:
+        client = NM.Client.new(None)
+        conn   = client.get_connection_by_id(conn_name)
+        if conn:
+            return conn.get_uuid()
+    except Exception:
+        pass
+    return ""
+
+
+if __name__ == "__main__":
+    main()
