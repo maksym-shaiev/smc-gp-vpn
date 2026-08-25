@@ -26,7 +26,6 @@ set -euo pipefail
 # Update RELEASE_BASE when the upstream PR is merged and a new release is cut
 # from yuezk/GlobalProtect-openconnect.
 RELEASE_BASE="https://github.com/maksym-shaiev/GlobalProtect-openconnect/releases/download/gpclient-smc-latest"
-SUMS_URL="${RELEASE_BASE}/SHA256SUMS"
 
 # ── paths ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,20 +91,20 @@ case "$UBUNTU_VERSION" in
         ;;
 esac
 
-# Derive the versioned binary name from the latest release's SHA256SUMS.
-# SHA256SUMS contains lines like:
-#   <hash>  gpclient-smc_2.6.5_ubuntu24.04_amd64
-# We pick the entry matching our suffix to get the exact filename.
+# Each matrix job publishes its own checksum file to avoid race conditions
+# when parallel jobs upload to the same release.
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-info "Fetching SHA256SUMS to resolve binary name …"
+SUMS_URL="${RELEASE_BASE}/SHA256SUMS-${BINARY_SUFFIX}"
+
+info "Fetching SHA256SUMS-${BINARY_SUFFIX} to resolve binary name …"
 curl -fsSL -o "$TMP_DIR/SHA256SUMS" "$SUMS_URL" \
     || die "Failed to download SHA256SUMS from $SUMS_URL"
 
-BINARY_NAME=$(awk '{print $2}' "$TMP_DIR/SHA256SUMS" | grep "_${BINARY_SUFFIX}_" || true)
+BINARY_NAME=$(awk '{print $2}' "$TMP_DIR/SHA256SUMS" | head -1)
 if [[ -z "$BINARY_NAME" ]]; then
-    die "No binary found for suffix '${BINARY_SUFFIX}' in SHA256SUMS:\n$(cat "$TMP_DIR/SHA256SUMS")"
+    die "Could not resolve binary name from SHA256SUMS:\n$(cat "$TMP_DIR/SHA256SUMS")"
 fi
 
 BINARY_URL="${RELEASE_BASE}/${BINARY_NAME}"
@@ -161,7 +160,7 @@ curl -fsSL --progress-bar -o "$TMP_DIR/gpclient-smc" "$BINARY_URL" \
 # ── 6. verify checksum ────────────────────────────────────────────────────────
 section "Verifying checksum"
 
-EXPECTED=$(grep "_${BINARY_SUFFIX}_" "$TMP_DIR/SHA256SUMS" | awk '{print $1}')
+EXPECTED=$(awk '{print $1}' "$TMP_DIR/SHA256SUMS")
 ACTUAL=$(sha256sum "$TMP_DIR/gpclient-smc" | awk '{print $1}')
 
 if [[ "$EXPECTED" != "$ACTUAL" ]]; then
