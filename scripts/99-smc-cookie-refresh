@@ -198,13 +198,17 @@ def main() -> None:
 
     conn_name = config.get("CONN_NAME", "SMC")
 
-    # Only act when our specific connection goes down
+    # Only act when our specific connection goes down.
+    # vpn-pre-down: NM waits for this — fires while the session is still alive,
+    #   before logout.esp is called. Refreshing here ensures the cookie on disk
+    #   is valid after reboot even when shutdown happens with VPN active.
+    # vpn-down: kept as fallback for unexpected drops where pre-down did not run.
     if conn_id != conn_name and conn_uuid != _get_uuid(conn_name):
         sys.exit(0)
-    if action != "vpn-down":
+    if action not in ("vpn-down", "vpn-pre-down"):
         sys.exit(0)
 
-    log(f"{conn_name} vpn-down on {iface} — refreshing gateway cookie")
+    log(f"{conn_name} {action} on {iface} — refreshing gateway cookie")
 
     result = get_fresh_cookie(config, pw)
     if result is None:
