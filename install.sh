@@ -196,6 +196,15 @@ sudo install -m 755 \
     "$DISPATCHER_DIR/99-smc-cookie-refresh"
 info "Installed: $DISPATCHER_DIR/99-smc-cookie-refresh"
 
+# vpn-pre-down scripts must live in pre-down.d/ — NM only calls scripts from
+# that directory for the vpn-pre-down event (clean disconnect / shutdown).
+# A symlink avoids duplication; both locations point to the same file.
+sudo mkdir -p "$DISPATCHER_DIR/pre-down.d"
+sudo ln -sf \
+    "$DISPATCHER_DIR/99-smc-cookie-refresh" \
+    "$DISPATCHER_DIR/pre-down.d/99-smc-cookie-refresh"
+info "Symlinked: $DISPATCHER_DIR/pre-down.d/99-smc-cookie-refresh"
+
 # ── 10. NM profile setup ──────────────────────────────────────────────────────
 section "Setting up NetworkManager VPN profile"
 
