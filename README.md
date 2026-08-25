@@ -83,7 +83,14 @@ the NM profile, and brings the VPN up. Takes ~30 seconds.
 
 ## Daily use
 
-Flip the GNOME **Network → VPN → SMC** toggle. No dialog appears.
+**Via GNOME:** flip the **Network → VPN → SMC** toggle. No dialog appears.
+
+**Via terminal:**
+
+```bash
+nmcli connection up SMC      # connect
+nmcli connection down SMC    # disconnect
+```
 
 When the VPN disconnects, the dispatcher script (`99-smc-cookie-refresh`)
 automatically mints a fresh gateway cookie in the background (~1–2 s). The
@@ -97,17 +104,13 @@ journalctl -t smc-cookie-refresh -f
 
 ---
 
-## Cookie expiry (~30 days)
+## When the VPN stops connecting
 
-When the portal session expires you will receive a desktop notification:
-
-> **SMC VPN — re-authentication required**
-> The portal session has expired. Run `smc-vpn-refresh` to log in again.
-
-Run:
+When the portal session expires, the GNOME toggle or `nmcli connection up SMC`
+will fail silently — the VPN simply does not come up. Run:
 
 ```bash
-smc-vpn-refresh                    # re-authenticate and reconnect
+smc-vpn-refresh                    # re-authenticate via browser and reconnect
 smc-vpn-refresh --no-connect       # update secrets only, no reconnect
 smc-vpn-refresh --browser firefox  # use Firefox instead of Chrome
 ```
