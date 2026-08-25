@@ -1,6 +1,15 @@
 # smc-gp-vpn
 
-GlobalProtect CAS VPN integration for NetworkManager on Ubuntu 24.04.
+GlobalProtect CAS VPN integration for NetworkManager on Ubuntu 24.04 and 26.04.
+
+## Supported platforms
+
+| Ubuntu | Architecture | Binary suffix |
+|---|---|---|
+| 24.04 LTS (Noble) | x86_64 | `ubuntu24.04_amd64` |
+| 26.04 LTS (Plucky) | x86_64 | `ubuntu26.04_amd64` |
+
+`install.sh` detects your Ubuntu version automatically and downloads the correct binary.
 
 Connects the GNOME Network → VPN toggle to a Palo Alto
 [Cloud Authentication Service (CAS)](https://docs.paloaltonetworks.com/globalprotect/10-2/globalprotect-admin/authentication/configure-cloud-authentication-service)
@@ -31,10 +40,10 @@ Until it is merged, the binary is built from
 
 ## Requirements
 
-- Ubuntu 24.04 (or compatible) with GNOME and NetworkManager
+- Ubuntu 24.04 or 26.04 (x86_64) with GNOME and NetworkManager
 - `network-manager-openconnect`
 - `python3-gi` + `gir1.2-nm-1.0`
-- `jq`, `curl`, `sudo`, `notify-send`
+- `jq`, `curl`, `sudo`, `notify-send`, `lsb_release`
 
 `install.sh` checks all of these and tells you what is missing.
 

@@ -5,14 +5,15 @@
 #
 # What this script does:
 #   1. Checks prerequisites
-#   2. Prompts for configuration (portal, connection name, browser)
-#   3. Writes ~/.config/smc-gp-vpn/config
-#   4. Downloads the gpclient-smc binary from the fork release and verifies SHA-256
-#   5. Installs gpclient-smc to ~/.local/bin/
-#   6. Installs smc-vpn-refresh to ~/.local/bin/
-#   7. Installs 99-smc-cookie-refresh dispatcher (requires sudo)
-#   8. Runs nm-profile-setup.py (creates or cleans the NM VPN profile)
-#   9. Prints next steps
+#   2. Detects Ubuntu version and selects the correct binary
+#   3. Prompts for configuration (portal, connection name, browser)
+#   4. Writes ~/.config/smc-gp-vpn/config
+#   5. Downloads the gpclient-smc binary from the fork release and verifies SHA-256
+#   6. Installs gpclient-smc to ~/.local/bin/
+#   7. Installs smc-vpn-refresh to ~/.local/bin/
+#   8. Installs 99-smc-cookie-refresh dispatcher (requires sudo)
+#   9. Runs nm-profile-setup.py (creates or cleans the NM VPN profile)
+#  10. Prints next steps
 #
 # Usage:
 #   bash install.sh
@@ -21,11 +22,11 @@
 
 set -euo pipefail
 
-# ── release coordinates ──────────────────────────────────────────────────────
-# Update BINARY_URL and SUMS_URL when the upstream PR is merged and a new
-# release is cut from yuezk/GlobalProtect-openconnect.
-BINARY_URL="https://github.com/maksym-shaiev/GlobalProtect-openconnect/releases/download/gpclient-smc-latest/gpclient-smc"
-SUMS_URL="https://github.com/maksym-shaiev/GlobalProtect-openconnect/releases/download/gpclient-smc-latest/SHA256SUMS"
+# ── release base URL ─────────────────────────────────────────────────────────
+# Update RELEASE_BASE when the upstream PR is merged and a new release is cut
+# from yuezk/GlobalProtect-openconnect.
+RELEASE_BASE="https://github.com/maksym-shaiev/GlobalProtect-openconnect/releases/download/gpclient-smc-latest"
+SUMS_URL="${RELEASE_BASE}/SHA256SUMS"
 
 # ── paths ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,7 +54,7 @@ section() { echo -e "\n${BOLD}── $* ──${RESET}"; }
 section "Checking prerequisites"
 
 MISSING=()
-for cmd in python3 curl jq nmcli sudo notify-send; do
+for cmd in python3 curl jq nmcli sudo notify-send lsb_release; do
     if ! command -v "$cmd" &>/dev/null; then
         MISSING+=("$cmd")
     fi
@@ -77,7 +78,40 @@ fi
 
 info "All prerequisites satisfied"
 
-# ── 2. interactive configuration ─────────────────────────────────────────────
+# ── 2. detect Ubuntu version ──────────────────────────────────────────────────
+section "Detecting Ubuntu version"
+
+UBUNTU_VERSION=$(lsb_release -rs)
+info "Detected Ubuntu $UBUNTU_VERSION"
+
+case "$UBUNTU_VERSION" in
+    24.04) BINARY_SUFFIX="ubuntu24.04" ;;
+    26.04) BINARY_SUFFIX="ubuntu26.04" ;;
+    *)
+        die "Unsupported Ubuntu version: $UBUNTU_VERSION\nSupported versions: 24.04, 26.04"
+        ;;
+esac
+
+# Derive the versioned binary name from the latest release's SHA256SUMS.
+# SHA256SUMS contains lines like:
+#   <hash>  gpclient-smc_2.6.5_ubuntu24.04_amd64
+# We pick the entry matching our suffix to get the exact filename.
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+info "Fetching SHA256SUMS to resolve binary name …"
+curl -fsSL -o "$TMP_DIR/SHA256SUMS" "$SUMS_URL" \
+    || die "Failed to download SHA256SUMS from $SUMS_URL"
+
+BINARY_NAME=$(awk '{print $2}' "$TMP_DIR/SHA256SUMS" | grep "_${BINARY_SUFFIX}_" || true)
+if [[ -z "$BINARY_NAME" ]]; then
+    die "No binary found for suffix '${BINARY_SUFFIX}' in SHA256SUMS:\n$(cat "$TMP_DIR/SHA256SUMS")"
+fi
+
+BINARY_URL="${RELEASE_BASE}/${BINARY_NAME}"
+info "Selected binary: $BINARY_NAME"
+
+# ── 3. interactive configuration ─────────────────────────────────────────────
 section "Configuration"
 
 prompt() {
@@ -97,7 +131,7 @@ echo "    PORTAL    = $PORTAL"
 echo "    CONN_NAME = $CONN_NAME"
 echo "    BROWSER   = $BROWSER"
 
-# ── 3. write config ───────────────────────────────────────────────────────────
+# ── 4. write config ───────────────────────────────────────────────────────────
 section "Writing config"
 
 mkdir -p "$CONFIG_DIR"
@@ -117,24 +151,17 @@ EOF
 chmod 600 "$CONFIG_FILE"
 info "Config written to $CONFIG_FILE"
 
-# ── 4. download binary ────────────────────────────────────────────────────────
+# ── 5. download binary ────────────────────────────────────────────────────────
 section "Downloading gpclient-smc binary"
 
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-info "Downloading binary …"
+info "Downloading $BINARY_NAME …"
 curl -fsSL --progress-bar -o "$TMP_DIR/gpclient-smc" "$BINARY_URL" \
     || die "Failed to download binary from $BINARY_URL"
 
-info "Downloading SHA256SUMS …"
-curl -fsSL -o "$TMP_DIR/SHA256SUMS" "$SUMS_URL" \
-    || die "Failed to download SHA256SUMS from $SUMS_URL"
-
-# ── 5. verify checksum ────────────────────────────────────────────────────────
+# ── 6. verify checksum ────────────────────────────────────────────────────────
 section "Verifying checksum"
 
-EXPECTED=$(awk '{print $1}' "$TMP_DIR/SHA256SUMS")
+EXPECTED=$(grep "_${BINARY_SUFFIX}_" "$TMP_DIR/SHA256SUMS" | awk '{print $1}')
 ACTUAL=$(sha256sum "$TMP_DIR/gpclient-smc" | awk '{print $1}')
 
 if [[ "$EXPECTED" != "$ACTUAL" ]]; then
@@ -142,14 +169,14 @@ if [[ "$EXPECTED" != "$ACTUAL" ]]; then
 fi
 info "Checksum verified: $ACTUAL"
 
-# ── 6. install gpclient-smc ───────────────────────────────────────────────────
+# ── 7. install gpclient-smc ───────────────────────────────────────────────────
 section "Installing gpclient-smc"
 
 mkdir -p "$BIN_DIR"
 install -m 755 "$TMP_DIR/gpclient-smc" "$BIN_DIR/gpclient-smc"
 info "Installed: $BIN_DIR/gpclient-smc"
 
-# ── 7. install smc-vpn-refresh ───────────────────────────────────────────────
+# ── 8. install smc-vpn-refresh ───────────────────────────────────────────────
 section "Installing smc-vpn-refresh"
 
 install -m 755 "$SCRIPT_DIR/scripts/smc-vpn-refresh" "$BIN_DIR/smc-vpn-refresh"
@@ -162,7 +189,7 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     warn '    export PATH="$HOME/.local/bin:$PATH"'
 fi
 
-# ── 8. install NM dispatcher ──────────────────────────────────────────────────
+# ── 9. install NM dispatcher ──────────────────────────────────────────────────
 section "Installing NM dispatcher (requires sudo)"
 
 sudo install -m 755 \
@@ -170,7 +197,7 @@ sudo install -m 755 \
     "$DISPATCHER_DIR/99-smc-cookie-refresh"
 info "Installed: $DISPATCHER_DIR/99-smc-cookie-refresh"
 
-# ── 9. NM profile setup ───────────────────────────────────────────────────────
+# ── 10. NM profile setup ──────────────────────────────────────────────────────
 section "Setting up NetworkManager VPN profile"
 
 python3 "$SCRIPT_DIR/scripts/nm-profile-setup.py" --config "$CONFIG_FILE"
