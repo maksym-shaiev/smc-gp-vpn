@@ -1,15 +1,16 @@
 # smc-gp-vpn
 
-GlobalProtect CAS VPN integration for NetworkManager on Ubuntu 24.04 and 26.04.
+GlobalProtect CAS VPN integration for NetworkManager on Ubuntu 24.04/26.04 and Arch-based distributions (incl. Omarchy).
 
 ## Supported platforms
 
-| Ubuntu | Architecture | Binary suffix |
+| Distribution | Architecture | Binary suffix |
 |---|---|---|
-| 24.04 LTS (Noble) | x86_64 | `ubuntu24.04_amd64` |
-| 26.04 LTS (Plucky) | x86_64 | `ubuntu26.04_amd64` |
+| Ubuntu 24.04 LTS (Noble) | x86_64 | `ubuntu24.04_amd64` |
+| Ubuntu 26.04 LTS (Plucky) | x86_64 | `ubuntu26.04_amd64` |
+| Arch / Omarchy (rolling) | x86_64 | `arch_x86_64` |
 
-`install.sh` detects your Ubuntu version automatically and downloads the correct binary.
+`install.sh` detects your distribution automatically and downloads the correct binary.
 
 Connects the GNOME Network → VPN toggle to a Palo Alto
 [Cloud Authentication Service (CAS)](https://docs.paloaltonetworks.com/globalprotect/10-2/globalprotect-admin/authentication/configure-cloud-authentication-service)
@@ -40,12 +41,12 @@ Until it is merged, the binary is built from
 
 ## Requirements
 
-- Ubuntu 24.04 or 26.04 (x86_64) with GNOME and NetworkManager
-- `network-manager-openconnect`
-- `python3-gi` + `gir1.2-nm-1.0`
-- `jq`, `curl`, `sudo`, `notify-send`, `lsb_release`
+- Ubuntu 24.04/26.04 or Arch-based distribution (incl. Omarchy), x86_64, with NetworkManager
+- `network-manager-openconnect` (Ubuntu) / `networkmanager-openconnect` (Arch)
+- `python3-gi` + `gir1.2-nm-1.0` (Ubuntu) / `python-gobject` (Arch)
+- `jq`, `curl`, `sudo`, `notify-send`
 
-`install.sh` checks all of these and tells you what is missing.
+`install.sh` checks all of these and tells you what is missing, with the correct package manager command for your distribution.
 
 ---
 
