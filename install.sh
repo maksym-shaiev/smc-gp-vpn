@@ -4,13 +4,13 @@
 # Sets up the GlobalProtect CAS VPN integration for NetworkManager.
 #
 # What this script does:
-#   1. Checks prerequisites
-#   2. Detects Ubuntu version and selects the correct binary
-#   3. Prompts for configuration (portal, connection name, browser)
-#   4. Writes ~/.config/smc-gp-vpn/config
-#   5. Downloads the gpclient-smc binary from the fork release and verifies SHA-256
-#   6. Installs gpclient-smc to ~/.local/bin/
-#   7. Installs smc-vpn-refresh to ~/.local/bin/
+#   1. Detects the distribution (Ubuntu / Arch-based incl. Omarchy)
+#   2. Checks prerequisites
+#   3. Selects the correct pre-built binary for the distribution
+#   4. Prompts for configuration (portal, connection name, browser)
+#   5. Writes ~/.config/smc-gp-vpn/config
+#   6. Downloads the gpclient-smc binary from the fork release and verifies SHA-256
+#   7. Installs gpclient-smc and smc-vpn-refresh to ~/.local/bin/
 #   8. Installs 99-smc-cookie-refresh dispatcher (requires sudo)
 #   9. Runs nm-profile-setup.py (creates or cleans the NM VPN profile)
 #  10. Prints next steps
@@ -18,7 +18,7 @@
 # Usage:
 #   bash install.sh
 #
-# Requirements: python3, python3-gi, jq, curl, nmcli, network-manager-openconnect
+# Supported: Ubuntu 24.04 / 26.04, Arch-based distributions (incl. Omarchy)
 
 set -euo pipefail
 
@@ -49,24 +49,60 @@ error()   { echo -e "${RED}[✗]${RESET} $*" >&2; }
 die()     { error "$*"; exit 1; }
 section() { echo -e "\n${BOLD}── $* ──${RESET}"; }
 
-# ── 1. prerequisites ─────────────────────────────────────────────────────────
+# ── 1. detect distribution ────────────────────────────────────────────────────
+section "Detecting distribution"
+
+if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+fi
+
+DISTRO=""
+case "${ID:-}" in
+    arch|omarchy) DISTRO="arch" ;;
+    ubuntu)       DISTRO="ubuntu" ;;
+    *)
+        case "${ID_LIKE:-}" in
+            *arch*)   DISTRO="arch" ;;
+            *debian*) DISTRO="ubuntu" ;;
+        esac
+        ;;
+esac
+
+if [[ -z "$DISTRO" ]]; then
+    die "Unsupported distribution: ${PRETTY_NAME:-${ID:-unknown}}\nSupported: Ubuntu 24.04/26.04, Arch-based (incl. Omarchy)"
+fi
+
+info "Detected: ${PRETTY_NAME:-$DISTRO} (distro=$DISTRO)"
+
+# ── 2. prerequisites ─────────────────────────────────────────────────────────
 section "Checking prerequisites"
 
 MISSING=()
-for cmd in python3 curl jq nmcli sudo notify-send lsb_release; do
+for cmd in python3 curl jq nmcli sudo notify-send; do
     if ! command -v "$cmd" &>/dev/null; then
         MISSING+=("$cmd")
     fi
 done
 
-# python3-gi (gi.repository.NM)
+# gi + NM introspection (python3-gi on Ubuntu, python-gobject on Arch)
 if ! python3 -c "import gi; gi.require_version('NM','1.0'); from gi.repository import NM" &>/dev/null; then
-    MISSING+=("python3-gi (install: sudo apt install python3-gi gir1.2-nm-1.0)")
+    if [[ "$DISTRO" == "ubuntu" ]]; then
+        MISSING+=("python3-gi (install: sudo apt install python3-gi gir1.2-nm-1.0)")
+    else
+        MISSING+=("python-gobject (install: sudo pacman -S python-gobject)")
+    fi
 fi
 
 # network-manager-openconnect
-if ! dpkg -l network-manager-openconnect &>/dev/null; then
-    MISSING+=("network-manager-openconnect (install: sudo apt install network-manager-openconnect)")
+if [[ "$DISTRO" == "ubuntu" ]]; then
+    if ! dpkg -l network-manager-openconnect &>/dev/null; then
+        MISSING+=("network-manager-openconnect (install: sudo apt install network-manager-openconnect)")
+    fi
+else
+    if ! pacman -Q networkmanager-openconnect &>/dev/null; then
+        MISSING+=("networkmanager-openconnect (install: sudo pacman -S networkmanager-openconnect)")
+    fi
 fi
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
@@ -77,17 +113,26 @@ fi
 
 info "All prerequisites satisfied"
 
-# ── 2. detect Ubuntu version ──────────────────────────────────────────────────
-section "Detecting Ubuntu version"
+# ── 3. resolve binary suffix ──────────────────────────────────────────────────
+section "Selecting binary for this system"
 
-UBUNTU_VERSION=$(lsb_release -rs)
-info "Detected Ubuntu $UBUNTU_VERSION"
-
-case "$UBUNTU_VERSION" in
-    24.04) BINARY_SUFFIX="ubuntu24.04" ;;
-    26.04) BINARY_SUFFIX="ubuntu26.04" ;;
-    *)
-        die "Unsupported Ubuntu version: $UBUNTU_VERSION\nSupported versions: 24.04, 26.04"
+case "$DISTRO" in
+    arch)
+        BINARY_SUFFIX="arch"
+        ;;
+    ubuntu)
+        if ! command -v lsb_release &>/dev/null; then
+            MISSING+=("lsb_release (install: sudo apt install lsb-release)")
+        fi
+        UBUNTU_VERSION=$(lsb_release -rs)
+        case "$UBUNTU_VERSION" in
+            24.04) BINARY_SUFFIX="ubuntu24.04" ;;
+            26.04) BINARY_SUFFIX="ubuntu26.04" ;;
+            *)
+                die "Unsupported Ubuntu version: $UBUNTU_VERSION\nSupported versions: 24.04, 26.04"
+                ;;
+        esac
+        info "Detected Ubuntu $UBUNTU_VERSION"
         ;;
 esac
 
@@ -110,7 +155,7 @@ fi
 BINARY_URL="${RELEASE_BASE}/${BINARY_NAME}"
 info "Selected binary: $BINARY_NAME"
 
-# ── 3. interactive configuration ─────────────────────────────────────────────
+# ── 4. interactive configuration ─────────────────────────────────────────────
 section "Configuration"
 
 prompt() {
@@ -130,7 +175,7 @@ echo "    PORTAL    = $PORTAL"
 echo "    CONN_NAME = $CONN_NAME"
 echo "    BROWSER   = $BROWSER"
 
-# ── 4. write config ───────────────────────────────────────────────────────────
+# ── 5. write config ───────────────────────────────────────────────────────────
 section "Writing config"
 
 mkdir -p "$CONFIG_DIR"
@@ -150,14 +195,14 @@ EOF
 chmod 600 "$CONFIG_FILE"
 info "Config written to $CONFIG_FILE"
 
-# ── 5. download binary ────────────────────────────────────────────────────────
+# ── 6. download binary ────────────────────────────────────────────────────────
 section "Downloading gpclient-smc binary"
 
 info "Downloading $BINARY_NAME …"
 curl -fsSL --progress-bar -o "$TMP_DIR/gpclient-smc" "$BINARY_URL" \
     || die "Failed to download binary from $BINARY_URL"
 
-# ── 6. verify checksum ────────────────────────────────────────────────────────
+# ── 7. verify checksum ────────────────────────────────────────────────────────
 section "Verifying checksum"
 
 EXPECTED=$(awk '{print $1}' "$TMP_DIR/SHA256SUMS")
@@ -168,14 +213,13 @@ if [[ "$EXPECTED" != "$ACTUAL" ]]; then
 fi
 info "Checksum verified: $ACTUAL"
 
-# ── 7. install gpclient-smc ───────────────────────────────────────────────────
+# ── 8. install binaries ───────────────────────────────────────────────────────
 section "Installing gpclient-smc"
 
 mkdir -p "$BIN_DIR"
 install -m 755 "$TMP_DIR/gpclient-smc" "$BIN_DIR/gpclient-smc"
 info "Installed: $BIN_DIR/gpclient-smc"
 
-# ── 8. install smc-vpn-refresh ───────────────────────────────────────────────
 section "Installing smc-vpn-refresh"
 
 install -m 755 "$SCRIPT_DIR/scripts/smc-vpn-refresh" "$BIN_DIR/smc-vpn-refresh"
@@ -184,7 +228,7 @@ info "Installed: $BIN_DIR/smc-vpn-refresh"
 # Ensure ~/.local/bin is on PATH
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     warn "$BIN_DIR is not in your PATH."
-    warn "Add the following to your ~/.bashrc or ~/.zshrc:"
+    warn "Add the following to your shell profile (~/.bashrc, ~/.zshrc, ...):"
     warn '    export PATH="$HOME/.local/bin:$PATH"'
 fi
 
@@ -226,12 +270,14 @@ ${BOLD}Next step:${RESET}
 
 ${BOLD}Daily use:${RESET}
 
-  Flip the GNOME Network → VPN → ${CONN_NAME} toggle.
+  Flip the GNOME Network → VPN → ${CONN_NAME} toggle, or run:
+
+    nmcli connection up ${CONN_NAME}      # connect
+    nmcli connection down ${CONN_NAME}    # disconnect
+
   No dialog will appear. The cookie auto-refreshes on disconnect.
 
-${BOLD}When the portal session expires (~30 days):${RESET}
-
-  You will receive a desktop notification. Run:
+${BOLD}When the VPN stops connecting (portal session expired):${RESET}
 
     ${GREEN}smc-vpn-refresh${RESET}            (re-authenticates and reconnects)
     ${GREEN}smc-vpn-refresh --no-connect${RESET} (update secrets only)
