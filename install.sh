@@ -147,13 +147,17 @@ info "Fetching SHA256SUMS-${BINARY_SUFFIX} to resolve binary name …"
 curl -fsSL -o "$TMP_DIR/SHA256SUMS" "$SUMS_URL" \
     || die "Failed to download SHA256SUMS from $SUMS_URL"
 
-BINARY_NAME=$(awk '{print $2}' "$TMP_DIR/SHA256SUMS" | head -1)
-if [[ -z "$BINARY_NAME" ]]; then
-    die "Could not resolve binary name from SHA256SUMS:\n$(cat "$TMP_DIR/SHA256SUMS")"
+BINARY_NAME=$(awk '{print $2}' "$TMP_DIR/SHA256SUMS" | grep '^gpclient-smc_' | head -1)
+AUTH_NAME=$(awk '{print $2}' "$TMP_DIR/SHA256SUMS" | grep '^gpauth-smc_' | head -1)
+if [[ -z "$BINARY_NAME" || -z "$AUTH_NAME" ]]; then
+    die "Could not resolve binary names from SHA256SUMS:\n$(cat "$TMP_DIR/SHA256SUMS")"
 fi
 
 BINARY_URL="${RELEASE_BASE}/${BINARY_NAME}"
-info "Selected binary: $BINARY_NAME"
+AUTH_URL="${RELEASE_BASE}/${AUTH_NAME}"
+info "Selected binaries:"
+echo "    gpclient: $BINARY_NAME"
+echo "    gpauth:   $AUTH_NAME"
 
 # ── 4. interactive configuration ─────────────────────────────────────────────
 section "Configuration"
@@ -189,29 +193,40 @@ PORTAL=$PORTAL
 CONN_NAME=$CONN_NAME
 BROWSER=$BROWSER
 GPCLIENT_BIN=$BIN_DIR/gpclient-smc
+GP_AUTH_BIN=$BIN_DIR/gpauth-smc
 CACHE=$HOME/.config/gpclient/smc-cookie.json
 EOF
 
 chmod 600 "$CONFIG_FILE"
 info "Config written to $CONFIG_FILE"
 
-# ── 6. download binary ────────────────────────────────────────────────────────
-section "Downloading gpclient-smc binary"
+# ── 6. download binaries ──────────────────────────────────────────────────────
+section "Downloading gpclient-smc binaries"
 
 info "Downloading $BINARY_NAME …"
 curl -fsSL --progress-bar -o "$TMP_DIR/gpclient-smc" "$BINARY_URL" \
     || die "Failed to download binary from $BINARY_URL"
 
-# ── 7. verify checksum ────────────────────────────────────────────────────────
-section "Verifying checksum"
+info "Downloading $AUTH_NAME …"
+curl -fsSL --progress-bar -o "$TMP_DIR/gpauth-smc" "$AUTH_URL" \
+    || die "Failed to download gpauth from $AUTH_URL"
 
-EXPECTED=$(awk '{print $1}' "$TMP_DIR/SHA256SUMS")
-ACTUAL=$(sha256sum "$TMP_DIR/gpclient-smc" | awk '{print $1}')
+# ── 7. verify checksums ───────────────────────────────────────────────────────
+section "Verifying checksums"
 
-if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-    die "SHA-256 mismatch!\n  expected: $EXPECTED\n  actual:   $ACTUAL"
+EXPECTED_CLIENT=$(awk -v n='gpclient-smc_' 'index($2, n) == 1 {print $1}' "$TMP_DIR/SHA256SUMS")
+ACTUAL_CLIENT=$(sha256sum "$TMP_DIR/gpclient-smc" | awk '{print $1}')
+if [[ "$EXPECTED_CLIENT" != "$ACTUAL_CLIENT" ]]; then
+    die "SHA-256 mismatch (gpclient-smc)!\n  expected: $EXPECTED_CLIENT\n  actual:   $ACTUAL_CLIENT"
 fi
-info "Checksum verified: $ACTUAL"
+info "gpclient-smc verified: $ACTUAL_CLIENT"
+
+EXPECTED_AUTH=$(awk -v n='gpauth-smc_' 'index($2, n) == 1 {print $1}' "$TMP_DIR/SHA256SUMS")
+ACTUAL_AUTH=$(sha256sum "$TMP_DIR/gpauth-smc" | awk '{print $1}')
+if [[ "$EXPECTED_AUTH" != "$ACTUAL_AUTH" ]]; then
+    die "SHA-256 mismatch (gpauth-smc)!\n  expected: $EXPECTED_AUTH\n  actual:   $ACTUAL_AUTH"
+fi
+info "gpauth-smc verified: $ACTUAL_AUTH"
 
 # ── 8. install binaries ───────────────────────────────────────────────────────
 section "Installing gpclient-smc"
@@ -219,6 +234,11 @@ section "Installing gpclient-smc"
 mkdir -p "$BIN_DIR"
 install -m 755 "$TMP_DIR/gpclient-smc" "$BIN_DIR/gpclient-smc"
 info "Installed: $BIN_DIR/gpclient-smc"
+
+section "Installing gpauth-smc"
+
+install -m 755 "$TMP_DIR/gpauth-smc" "$BIN_DIR/gpauth-smc"
+info "Installed: $BIN_DIR/gpauth-smc"
 
 section "Installing smc-vpn-refresh"
 

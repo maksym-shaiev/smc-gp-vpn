@@ -81,10 +81,20 @@ def get_cookie(config: dict, browser: str) -> tuple[str, str]:
         "--cookie-cache", cache,
         "--print-cookie",
     ]
+    # Force gpclient to use our gpauth (same tree as gpclient-smc) instead of
+    # the system /usr/bin/gpauth, whose CLI may not match (e.g. --host-id).
+    env = os.environ.copy()
+    gpauth = config.get("GP_AUTH_BIN", "").strip()
+    if gpauth and os.path.isfile(gpauth):
+        env["GP_AUTH_BINARY"] = gpauth
+    elif gpauth:
+        print(f"    gpauth not found at {gpauth} — falling back to system gpauth",
+              flush=True)
     print(f"[1/4] Running: {' '.join(cmd)}", flush=True)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=300, env=env)
     except FileNotFoundError:
         die(f"gpclient-smc not found at {gpclient}")
     except subprocess.TimeoutExpired:

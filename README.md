@@ -122,10 +122,11 @@ smc-vpn-refresh --browser firefox  # use Firefox instead of Chrome
 
 | Path | Purpose |
 |---|---|
-| `~/.config/smc-gp-vpn/config` | Configuration (portal, connection name, browser) |
+| `~/.config/smc-gp-vpn/config` | Configuration (portal, connection name, browser, binary paths) |
 | `~/.local/bin/gpclient-smc` | Patched gpclient binary |
+| `~/.local/bin/gpauth-smc` | Matching gpauth binary (same build tree as gpclient-smc) |
 | `~/.local/bin/smc-vpn-refresh` | Manual refresh + reconnect script |
-| `/etc/NetworkManager/dispatcher.d/99-smc-cookie-refresh` | Auto-refresh on vpn-down |
+| `/etc/NetworkManager/dispatcher.d/99-smc-cookie-refresh` | Auto-refresh on vpn-down / vpn-pre-down |
 
 ---
 
@@ -146,7 +147,7 @@ the NM profile cleanly.
 ## Uninstall
 
 ```bash
-rm -f ~/.local/bin/gpclient-smc ~/.local/bin/smc-vpn-refresh
+rm -f ~/.local/bin/gpclient-smc ~/.local/bin/gpauth-smc ~/.local/bin/smc-vpn-refresh
 rm -rf ~/.config/smc-gp-vpn
 sudo rm -f /etc/NetworkManager/dispatcher.d/99-smc-cookie-refresh
 
@@ -193,3 +194,7 @@ Key facts:
 - Three secrets must be present for NM to skip the auth dialog: `cookie`,
   `gateway`, and `gwcert` (empty string satisfies the check; empty → normal
   PKI validation, not certificate pinning).
+- `gpclient` spawns `gpauth` for SAML/CAS auth. `gpclient-smc` and `gpauth-smc`
+  are always built from the same commit and wired via the `GP_AUTH_BINARY`
+  env var, so the system `gpauth` (potentially a different version with a
+  different CLI) is never used.

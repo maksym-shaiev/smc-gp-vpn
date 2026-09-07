@@ -115,9 +115,14 @@ def get_fresh_cookie(config: dict, pw) -> tuple[str, str] | None:
                           os.path.join(pw.pw_dir, ".config", "gpclient", "smc-cookie.json"))
     portal   = config.get("PORTAL", "us-access.stagwellglobal.com")
     browser  = config.get("BROWSER", "chrome")
+    gpauth   = config.get("GP_AUTH_BIN", "").strip()
 
-    cmd = [
-        "sudo", "-u", pw.pw_name,
+    cmd = ["sudo", "-u", pw.pw_name]
+    # Force our gpauth (same tree as gpclient-smc): env vars set in this process
+    # do not survive `sudo -u` (env_reset), so pass them via /usr/bin/env instead.
+    if gpauth and os.path.isfile(gpauth):
+        cmd += ["/usr/bin/env", f"GP_AUTH_BINARY={gpauth}"]
+    cmd += [
         gpclient, "connect", portal,
         "--browser", browser,
         "--cookie-cache", cache,
