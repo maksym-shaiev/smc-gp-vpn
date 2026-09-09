@@ -29,6 +29,7 @@ connection name) are derived at runtime.
 import os
 import sys
 import glob
+import json
 import subprocess
 import syslog
 import gi
@@ -116,6 +117,20 @@ def get_fresh_cookie(config: dict, pw) -> tuple[str, str] | None:
     portal   = config.get("PORTAL", "us-access.stagwellglobal.com")
     browser  = config.get("BROWSER", "chrome")
     gpauth   = config.get("GP_AUTH_BIN", "").strip()
+
+    # Check if cookie cache has valid data before attempting refresh.
+    # If the cache is empty or the portal session has expired, skip
+    # the gpclient call entirely — it would open a browser for
+    # re-authentication, which is unwanted on manual disconnect.
+    try:
+        with open(cache) as f:
+            cache_data = json.load(f)
+        if not cache_data.get("auth_cookie", {}).get("userAuthCookie"):
+            log("Cookie cache empty or invalid — skipping refresh (no browser auth)")
+            return None
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        log("Cookie cache missing or corrupt — skipping refresh")
+        return None
 
     cmd = ["sudo", "-u", pw.pw_name]
     # Force our gpauth (same tree as gpclient-smc): env vars set in this process
