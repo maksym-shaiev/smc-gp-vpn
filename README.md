@@ -118,6 +118,31 @@ smc-vpn-refresh --browser firefox  # use Firefox instead of Chrome
 
 ---
 
+## Bar widget (Omarchy only)
+
+On Omarchy, `install.sh` offers to install the GlobalProtect Omarchy bar widget
+([gp-vpn-omarchy](https://github.com/maksym-shaiev/gp-vpn-omarchy)) at the end
+of the install. Accepting installs the widget as an Omarchy plugin and enables
+it in the right bar section.
+
+The widget shows VPN on/off state in the top bar and opens a popup with
+connection details, public IP / country, and Refresh cookie / Reconnect
+buttons. The global hotkey `Super + Alt + V` opens the popup anywhere.
+
+If you skipped the prompt, install the widget later with:
+
+```bash
+omarchy plugin add https://github.com/maksym-shaiev/gp-vpn-omarchy.git --enable
+```
+
+Remove it with:
+
+```bash
+omarchy plugin remove gp-vpn
+```
+
+---
+
 ## Files installed
 
 | Path | Purpose |
@@ -146,23 +171,51 @@ the NM profile cleanly.
 
 ## Uninstall
 
+### Option A — using the uninstall script
+
+```bash
+bash uninstall.sh
+```
+
+Or from a fresh clone:
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/maksym-shaiev/smc-gp-vpn/main/uninstall.sh)
+```
+
+To also remove the NM VPN profile:
+
+```bash
+bash uninstall.sh --remove-profile
+```
+
+### Option B — manual uninstall
+
 ```bash
 rm -f ~/.local/bin/gpclient-smc ~/.local/bin/gpauth-smc ~/.local/bin/smc-vpn-refresh
-rm -rf ~/.config/smc-gp-vpn
+rm -rf ~/.config/smc-gp-vpn ~/.config/gpclient
 sudo rm -f /etc/NetworkManager/dispatcher.d/99-smc-cookie-refresh
+sudo rm -f /etc/NetworkManager/dispatcher.d/pre-down.d/99-smc-cookie-refresh
+```
 
-# Clear secrets from the NM profile (leaves the connection intact)
-python3 - <<'EOF'
-import gi; gi.require_version('NM','1.0')
-from gi.repository import NM, GLib
-c = NM.Client.new(None).get_connection_by_id('SMC')
-s = c.get_setting_vpn()
-for k in ('cookie', 'gateway', 'gwcert'): s.remove_secret(k)
-c.update2(c.to_dbus(NM.ConnectionSerializationFlags.ALL),
-          NM.SettingsUpdate2Flags.TO_DISK, None, None, None)
-ml = GLib.MainLoop(); GLib.timeout_add(700, ml.quit); ml.run()
-print("secrets cleared")
-EOF
+To remove the NM VPN profile manually:
+
+```bash
+nmcli connection delete SMC
+```
+
+### Optional cleanup
+
+Remove the Omarchy bar widget (if installed):
+
+```bash
+omarchy plugin remove gp-vpn
+```
+
+Or run the widget's uninstaller:
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/maksym-shaiev/gp-vpn-omarchy/main/uninstall.sh)
 ```
 
 ---

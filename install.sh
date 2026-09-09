@@ -274,6 +274,32 @@ section "Setting up NetworkManager VPN profile"
 
 python3 "$SCRIPT_DIR/scripts/nm-profile-setup.py" --config "$CONFIG_FILE"
 
+# ── 11. Omarchy bar widget (Omarchy only) ────────────────────────────────────
+OMARCHY_WIDGET_URL="https://github.com/maksym-shaiev/gp-vpn-omarchy.git"
+
+IS_OMARCHY=0
+if [[ "$DISTRO" == "arch" && -n "$(command -v omarchy-shell 2>/dev/null || true)" ]]; then
+    IS_OMARCHY=1
+fi
+
+if [[ $IS_OMARCHY -eq 1 ]]; then
+    section "Omarchy bar widget (Omarchy only)"
+    read -rp "  Install the Omarchy bar widget (gp-vpn)? [Y/n]: " want_widget
+    want_widget="${want_widget:-Y}"
+    if [[ "$want_widget" =~ ^[Yy] ]]; then
+        if command -v omarchy-plugin-add &>/dev/null; then
+            omarchy-plugin-add "$OMARCHY_WIDGET_URL" --enable --yes
+        else
+            warn "omarchy-plugin-add not found; install the widget manually:"
+            warn "  omarchy plugin add $OMARCHY_WIDGET_URL --enable"
+        fi
+    else
+        info "Skipped the Omarchy bar widget"
+    fi
+else
+    info "Not Omarchy — skipping the bar widget"
+fi
+
 # ── done ──────────────────────────────────────────────────────────────────────
 section "Installation complete"
 
