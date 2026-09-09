@@ -303,30 +303,28 @@ fi
 # ── done ──────────────────────────────────────────────────────────────────────
 section "Installation complete"
 
-cat <<EOF
-
-${BOLD}Next step:${RESET}
-
-  Run the following to authenticate and connect for the first time:
-
-    ${GREEN}smc-vpn-refresh${RESET}
-
-  This will open ${BROWSER} for CAS login, mint a gateway cookie,
-  write it to the '${CONN_NAME}' NM profile, and bring the VPN up.
-
-${BOLD}Daily use:${RESET}
-
-  Flip the GNOME Network → VPN → ${CONN_NAME} toggle, or run:
-
-    nmcli connection up ${CONN_NAME}      # connect
-    nmcli connection down ${CONN_NAME}    # disconnect
-
-  No dialog will appear. The cookie auto-refreshes on disconnect.
-
-${BOLD}When the VPN stops connecting (portal session expired):${RESET}
-
-    ${GREEN}smc-vpn-refresh${RESET}            (re-authenticates and reconnects)
-    ${GREEN}smc-vpn-refresh --no-connect${RESET} (update secrets only)
-    ${GREEN}smc-vpn-refresh --browser firefox${RESET}
-
-EOF
+echo -e ""
+echo -e "${BOLD}Next step:${RESET}"
+echo -e ""
+echo -e "  Run the following to authenticate and connect for the first time:"
+echo -e ""
+echo -e "    ${GREEN}smc-vpn-refresh${RESET}"
+echo -e ""
+echo -e "  This will open ${BROWSER} for CAS login, mint a gateway cookie,"
+echo -e "  write it to the '${CONN_NAME}' NM profile, and bring the VPN up."
+echo -e ""
+echo -e "${BOLD}Daily use:${RESET}"
+echo -e ""
+echo -e "  Flip the GNOME Network → VPN → ${CONN_NAME} toggle, or run:"
+echo -e ""
+echo -e "    nmcli connection up ${CONN_NAME}      # connect"
+echo -e "    nmcli connection down ${CONN_NAME}    # disconnect"
+echo -e ""
+echo -e "  No dialog will appear. The cookie auto-refreshes on disconnect."
+echo -e ""
+echo -e "${BOLD}When the VPN stops connecting (portal session expired):${RESET}"
+echo -e ""
+echo -e "    ${GREEN}smc-vpn-refresh${RESET}            (re-authenticate and reconnect)"
+echo -e "    ${GREEN}smc-vpn-refresh --no-connect${RESET} (update secrets only)"
+echo -e "    ${GREEN}smc-vpn-refresh --browser firefox${RESET}"
+echo -e ""

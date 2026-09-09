@@ -133,27 +133,25 @@ fi
 # ── 6. done ──────────────────────────────────────────────────────────────────
 section "Uninstall complete"
 
-cat <<EOF
-
-${BOLD}smc-gp-vpn has been removed.${RESET}
-
-${BOLD}Optional cleanup:${RESET}
-
-  Remove the NM VPN profile (if not already done):
-
-    ${GREEN}nmcli connection delete SMC${RESET}
-
-  Remove the Omarchy bar widget (if installed):
-
-    ${GREEN}omarchy plugin remove gp-vpn${RESET}
-
-  Or run the widget's uninstaller:
-
-    ${GREEN}bash <(curl -sL https://raw.githubusercontent.com/maksym-shaiev/gp-vpn-omarchy/main/uninstall.sh)${RESET}
-
-${BOLD}Reinstall:${RESET}
-
-    ${GREEN}git clone https://github.com/maksym-shaiev/smc-gp-vpn.git${RESET}
-    ${GREEN}cd smc-gp-vpn && bash install.sh${RESET}
-
-EOF
+echo -e ""
+echo -e "${BOLD}smc-gp-vpn has been removed.${RESET}"
+echo -e ""
+echo -e "${BOLD}Optional cleanup:${RESET}"
+echo -e ""
+echo -e "  Remove the NM VPN profile (if not already done):"
+echo -e ""
+echo -e "    ${GREEN}nmcli connection delete SMC${RESET}"
+echo -e ""
+echo -e "  Remove the Omarchy bar widget (if installed):"
+echo -e ""
+echo -e "    ${GREEN}omarchy plugin remove gp-vpn${RESET}"
+echo -e ""
+echo -e "  Or run the widget's uninstaller:"
+echo -e ""
+echo -e "    ${GREEN}bash <(curl -sL https://raw.githubusercontent.com/maksym-shaiev/gp-vpn-omarchy/main/uninstall.sh)${RESET}"
+echo -e ""
+echo -e "${BOLD}Reinstall:${RESET}"
+echo -e ""
+echo -e "    ${GREEN}git clone https://github.com/maksym-shaiev/smc-gp-vpn.git${RESET}"
+echo -e "    ${GREEN}cd smc-gp-vpn && bash install.sh${RESET}"
+echo -e ""
