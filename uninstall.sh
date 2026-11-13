@@ -9,7 +9,7 @@
 #   3. NM dispatcher script from /etc/NetworkManager/dispatcher.d/
 #
 # What this script does NOT remove by default:
-#   - NM VPN profile (SMC) — out of scope, but see --remove-profile flag
+#   - NM VPN profiles (one per endpoint, e.g. SMC-UK / SMC-US) — see --remove-profile
 #   - Omarchy bar widget (gp-vpn) — separate uninstaller
 #
 # Usage:
@@ -44,6 +44,18 @@ while [[ $# -gt 0 ]]; do
         ;;
     esac
 done
+
+# Collect the NM connection names of all configured endpoints (before the
+# config is removed in step 3) so --remove-profile can delete each of them.
+CONN_NAMES=()
+SMC_CONFIG="$HOME/.config/smc-gp-vpn/config"
+if [[ -r "$SMC_CONFIG" ]]; then
+    if grep -q '^ENDPOINTS=' "$SMC_CONFIG"; then
+        mapfile -t CONN_NAMES < <(awk -F= '/^ENDPOINT_[A-Z0-9_]+_CONN_NAME=/{print $2}' "$SMC_CONFIG" | sort -u)
+    else
+        mapfile -t CONN_NAMES < <(awk -F= '$1=="CONN_NAME"{print $2}' "$SMC_CONFIG")
+    fi
+fi
 
 # ── 1. confirmation ──────────────────────────────────────────────────────────
 section "Uninstall smc-gp-vpn"
@@ -106,27 +118,34 @@ else
     warn "$PRE_DOWN_DIR/99-smc-cookie-refresh does not exist — skipping"
 fi
 
-# ── 5. optional: remove NM profile ───────────────────────────────────────────
+# ── 5. optional: remove NM profiles ──────────────────────────────────────────
 if [[ $REMOVE_PROFILE -eq 1 ]]; then
-    section "Removing NM VPN profile"
+    section "Removing NM VPN profiles"
+
+    if [[ ${#CONN_NAMES[@]} -eq 0 ]]; then
+        CONN_NAMES=("SMC")
+    fi
 
     if python3 -c "import gi; gi.require_version('NM','1.0'); from gi.repository import NM, GLib" &>/dev/null; then
-        python3 - <<'EOF'
+        python3 - "${CONN_NAMES[@]}" <<'EOF'
+import sys
 import gi
 gi.require_version('NM', '1.0')
-from gi.repository import NM, GLib
+from gi.repository import NM
 
+names = sys.argv[1:]
 client = NM.Client.new(None)
-conn = client.get_connection_by_id('SMC')
-if conn:
-    conn.delete()
-    print("Removed NM connection 'SMC'")
-else:
-    print("NM connection 'SMC' not found")
+for name in names:
+    conn = client.get_connection_by_id(name)
+    if conn:
+        conn.delete()
+        print(f"Removed NM connection '{name}'")
+    else:
+        print(f"NM connection '{name}' not found")
 EOF
     else
-        warn "python3-gi not available — cannot remove NM profile"
-        warn "Remove it manually: nmcli connection delete SMC"
+        warn "python3-gi not available — cannot remove NM profiles"
+        warn "Remove them manually: nmcli connection delete <name>"
     fi
 fi
 
@@ -138,9 +157,9 @@ echo -e "${BOLD}smc-gp-vpn has been removed.${RESET}"
 echo -e ""
 echo -e "${BOLD}Optional cleanup:${RESET}"
 echo -e ""
-echo -e "  Remove the NM VPN profile (if not already done):"
+echo -e "  Remove the NM VPN profiles (if not already done):"
 echo -e ""
-echo -e "    ${GREEN}nmcli connection delete SMC${RESET}"
+echo -e "    ${GREEN}nmcli connection delete SMC-UK SMC-US${RESET}"
 echo -e ""
 echo -e "  Remove the Omarchy bar widget (if installed):"
 echo -e ""

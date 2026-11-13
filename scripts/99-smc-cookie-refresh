@@ -7,10 +7,10 @@ NetworkManager calls dispatcher scripts as:
 
 with environment variables CONNECTION_UUID, CONNECTION_ID, etc.
 
-Strategy: when the configured VPN goes down, mint a fresh gateway
-cookie (using the still-valid portal-userauthcookie from the cache)
-and write it back to the NM profile so the next toggle-on works
-without user intervention.
+Strategy: when one of the configured VPN endpoints goes down, mint a fresh
+gateway cookie (using the still-valid portal-userauthcookie from that
+endpoint's cache) and write it back to the NM profile so the next toggle-on
+works without user intervention.
 
 If the portal session has also expired (browser login required), send
 a desktop notification and exit cleanly — the toggle-on will fail and
@@ -23,13 +23,16 @@ manual toggle-on attempt.
 
 Configuration is read from ~/.config/smc-gp-vpn/config, written by
 install.sh. All previously hardcoded values (username, UID, portal,
-connection name) are derived at runtime.
+connection name) are derived at runtime. Multiple endpoints
+(ENDPOINTS / ENDPOINT_<ID>_* keys) are supported: the endpoint whose
+NM connection went down is refreshed; unknown connections are ignored.
 """
 
 import os
 import sys
 import glob
 import json
+import shutil
 import subprocess
 import syslog
 import gi
@@ -74,9 +77,53 @@ def find_config() -> tuple[str, dict]:
     return "", {}, None
 
 
+def parse_endpoints(config: dict, home_dir: str) -> list[dict]:
+    """Parse ENDPOINT_* entries from config; fall back to legacy single-endpoint keys.
+
+    Mirrors parse_endpoints() in smc-vpn-refresh / nm-profile-setup.py.
+    Each endpoint is a dict: {id, portal, conn_name, cache}. home_dir is the
+    invoking user's home (the dispatcher runs as root, so ~ is /root).
+    """
+    endpoints: list[dict] = []
+    for eid in (s.strip().upper() for s in config.get("ENDPOINTS", "").split(",")):
+        if not eid or not eid.replace("_", "").isalnum():
+            continue
+        portal = config.get(f"ENDPOINT_{eid}_PORTAL", "")
+        conn = config.get(f"ENDPOINT_{eid}_CONN_NAME", "")
+        if not portal or not conn:
+            continue
+        cache = config.get(
+            f"ENDPOINT_{eid}_CACHE",
+            os.path.join(home_dir, f".config/gpclient/smc-cookie-{eid.lower()}.json"),
+        )
+        endpoints.append({"id": eid, "portal": portal, "conn_name": conn, "cache": cache})
+
+    if endpoints:
+        return endpoints
+
+    # Legacy single-endpoint config (written by older install.sh versions).
+    portal = config.get("PORTAL", "")
+    if portal:
+        return [{
+            "id": "MAIN",
+            "portal": portal,
+            "conn_name": config.get("CONN_NAME", "SMC"),
+            "cache": config.get("CACHE", ""),
+        }]
+    return []
+
+
 # ── logging / notification ───────────────────────────────────────────────────
 
 LOG_TAG = "smc-cookie-refresh"
+
+
+def unquote(v: str) -> str:
+    """gpclient >= 3.0 prints COOKIE='<value>' / HOST='<value>' with literal
+    shell-style quotes (the output is designed to be eval-ed). Strip them."""
+    if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+        return v[1:-1]
+    return v
 
 
 def log(msg: str) -> None:
@@ -105,18 +152,31 @@ def notify(pw, summary: str, body: str) -> None:
 
 # ── cookie refresh ───────────────────────────────────────────────────────────
 
-def get_fresh_cookie(config: dict, pw) -> tuple[str, str] | None:
+def gpclient_path(config: dict, pw) -> str:
+    """First existing candidate: config value, ~/.local/bin/gpclient-smc,
+    gpclient on PATH, /usr/bin/gpclient."""
+    candidates = [
+        config.get("GPCLIENT_BIN", ""),
+        os.path.join(pw.pw_dir, ".local", "bin", "gpclient-smc"),
+        shutil.which("gpclient") or "",
+        "/usr/bin/gpclient",
+    ]
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            return cand
+    return candidates[-1]
+
+
+def get_fresh_cookie(config: dict, endpoint: dict, pw) -> tuple[str, str] | None:
     """
-    Run gpclient-smc --print-cookie as the real user.
+    Run gpclient --print-cookie as the real user.
     Returns (COOKIE, HOST) or None if the portal session has expired.
     """
-    gpclient = config.get("GPCLIENT_BIN",
-                          os.path.join(pw.pw_dir, ".local", "bin", "gpclient-smc"))
-    cache    = config.get("CACHE",
-                          os.path.join(pw.pw_dir, ".config", "gpclient", "smc-cookie.json"))
-    portal   = config.get("PORTAL", "us-access.stagwellglobal.com")
-    browser  = config.get("BROWSER", "chrome")
-    gpauth   = config.get("GP_AUTH_BIN", "").strip()
+    gpclient = gpclient_path(config, pw)
+    cache = endpoint["cache"]
+    portal = endpoint["portal"]
+    browser = config.get("BROWSER", "chrome")
+    gpauth = config.get("GP_AUTH_BIN", "").strip()
 
     # Check if cookie cache has valid data before attempting refresh.
     # If the cache is empty or the portal session has expired, skip
@@ -141,7 +201,7 @@ def get_fresh_cookie(config: dict, pw) -> tuple[str, str] | None:
         gpclient, "connect", portal,
         "--browser", browser,
         "--cookie-cache", cache,
-        "--print-cookie",
+        "--cookie-only",
     ]
     env = os.environ.copy()
     env["HOME"] = pw.pw_dir
@@ -161,9 +221,9 @@ def get_fresh_cookie(config: dict, pw) -> tuple[str, str] | None:
     cookie = host = ""
     for line in result.stdout.splitlines():
         if line.startswith("COOKIE="):
-            cookie = line[len("COOKIE="):]
+            cookie = unquote(line[len("COOKIE="):])
         elif line.startswith("HOST="):
-            host = line[len("HOST="):]
+            host = unquote(line[len("HOST="):])
 
     if not cookie.startswith("authcookie=") or not host:
         log(
@@ -216,21 +276,25 @@ def main() -> None:
         # No smc-gp-vpn config found for any logged-in user — not our VPN
         sys.exit(0)
 
-    conn_name = config.get("CONN_NAME", "SMC")
+    endpoints = parse_endpoints(config, pw.pw_dir)
+    if not endpoints:
+        sys.exit(0)
 
-    # Only act when our specific connection goes down.
+    # Only act when one of our configured endpoint connections goes down.
     # vpn-pre-down: NM waits for this — fires while the session is still alive,
     #   before logout.esp is called. Refreshing here ensures the cookie on disk
     #   is valid after reboot even when shutdown happens with VPN active.
     # vpn-down: kept as fallback for unexpected drops where pre-down did not run.
-    if conn_id != conn_name and conn_uuid != _get_uuid(conn_name):
+    endpoint = _endpoint_for_connection(endpoints, conn_id, conn_uuid)
+    if endpoint is None:
         sys.exit(0)
     if action not in ("vpn-down", "vpn-pre-down"):
         sys.exit(0)
 
-    log(f"{conn_name} {action} on {iface} — refreshing gateway cookie")
+    conn_name = endpoint["conn_name"]
+    log(f"[{endpoint['id']}] {conn_name} {action} on {iface} — refreshing gateway cookie")
 
-    result = get_fresh_cookie(config, pw)
+    result = get_fresh_cookie(config, endpoint, pw)
     if result is None:
         log(f"Portal session expired — manual `smc-vpn-refresh` required")
         notify(
@@ -255,6 +319,19 @@ def _get_uuid(conn_name: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def _endpoint_for_connection(endpoints: list[dict], conn_id: str, conn_uuid: str) -> dict | None:
+    """Match a dispatcher event to one of our configured endpoints by
+    connection id, falling back to a UUID lookup (id may have changed)."""
+    for ep in endpoints:
+        if conn_id == ep["conn_name"]:
+            return ep
+    if conn_uuid:
+        for ep in endpoints:
+            if conn_uuid and conn_uuid == _get_uuid(ep["conn_name"]):
+                return ep
+    return None
 
 
 if __name__ == "__main__":

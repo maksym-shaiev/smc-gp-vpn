@@ -3,10 +3,21 @@
 nm-profile-setup.py — Stage 0–3 NetworkManager profile setup.
 
 Run by install.sh after config is written. Reads
-~/.config/smc-gp-vpn/config for CONN_NAME, PORTAL, and the
-installing user's identity.
+~/.config/smc-gp-vpn/config for the endpoint list (ENDPOINTS /
+ENDPOINT_<ID>_* keys) and the installing user's identity.
 
-Two modes:
+Multi-endpoint: one NM connection is created per endpoint, e.g.
+SMC-UK (uk-access...) and SMC-US (us-access...). Each profile stores
+its own gateway cookie, so switching endpoints in the widget does not
+require a re-login.
+
+Legacy migration: if a pre-multi-endpoint profile exists (its
+vpn.data gateway matches one of the configured endpoint portals but
+its name is not the endpoint's connection name), it is RENAMED to
+that endpoint's connection name and its secrets are left untouched —
+the existing portal cookie keeps working without a re-login.
+
+Two modes per endpoint:
   CREATE  — NM connection CONN_NAME does not exist: create it from
              scratch with correct vpn.data and empty secrets.
   CLEAN   — NM connection CONN_NAME already exists: remove any
@@ -51,6 +62,43 @@ def load_config(path: str) -> dict:
     except FileNotFoundError:
         die(f"Config file not found: {path}\nRun install.sh first.")
     return config
+
+
+def parse_endpoints(config: dict) -> list[dict]:
+    """Parse ENDPOINT_* entries from config; fall back to legacy single-endpoint keys.
+
+    Mirrors parse_endpoints() in smc-vpn-refresh / 99-smc-cookie-refresh.
+    Each endpoint is a dict: {id, portal, conn_name, cache}.
+    """
+    endpoints: list[dict] = []
+    for eid in (s.strip().upper() for s in config.get("ENDPOINTS", "").split(",")):
+        if not eid or not eid.replace("_", "").isalnum():
+            continue
+        portal = config.get(f"ENDPOINT_{eid}_PORTAL", "")
+        conn = config.get(f"ENDPOINT_{eid}_CONN_NAME", "")
+        if not portal or not conn:
+            continue
+        cache = config.get(
+            f"ENDPOINT_{eid}_CACHE",
+            os.path.expanduser(f"~/.config/gpclient/smc-cookie-{eid.lower()}.json"),
+        )
+        endpoints.append({"id": eid, "portal": portal, "conn_name": conn, "cache": cache})
+
+    if endpoints:
+        return endpoints
+
+    # Legacy single-endpoint config (written by older install.sh versions).
+    portal = config.get("PORTAL", "")
+    if portal:
+        return [{
+            "id": "MAIN",
+            "portal": portal,
+            "conn_name": config.get("CONN_NAME", "SMC"),
+            "cache": config.get(
+                "CACHE", os.path.expanduser("~/.config/gpclient/smc-cookie.json")
+            ),
+        }]
+    return []
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -199,11 +247,85 @@ def clean_profile(conn: NM.RemoteConnection, conn_name: str, portal: str) -> Non
     print(f"  Cleaned '{conn_name}' — vpn.data rewritten, secrets reset.")
 
 
+# ── legacy migration ─────────────────────────────────────────────────────────
+
+def is_our_gp_profile(conn: NM.RemoteConnection) -> bool:
+    """True for NM openconnect profiles in GlobalProtect (protocol=gp) mode."""
+    s_vpn = conn.get_setting_vpn()
+    if s_vpn is None:
+        return False
+    if s_vpn.get_service_type() != "org.freedesktop.NetworkManager.openconnect":
+        return False
+    protocol = s_vpn.get_data_item("protocol")
+    return protocol is None or protocol == "gp"
+
+
+def profile_gateway(conn: NM.RemoteConnection) -> str:
+    s_vpn = conn.get_setting_vpn()
+    return (s_vpn.get_data_item("gateway") or "").strip().lower() if s_vpn else ""
+
+
+def rename_connection(conn: NM.RemoteConnection, new_id: str) -> None:
+    s_con = conn.get_setting_connection()
+    s_con.set_property(NM.SETTING_CONNECTION_ID, new_id)
+    conn.update2(
+        conn.to_dbus(NM.ConnectionSerializationFlags.ALL),
+        NM.SettingsUpdate2Flags.TO_DISK,
+        None, None, None,
+    )
+    pump_loop()
+
+
+def migrate_legacy_profiles(
+    client: NM.Client, endpoints: list[dict]
+) -> dict[str, bool]:
+    """Rename pre-multi-endpoint profiles to their endpoint's connection name.
+
+    A legacy profile is matched by its vpn.data gateway: if it points at an
+    endpoint's portal and that endpoint's connection name does not exist yet,
+    the profile is renamed and its secrets are PRESERVED (no re-login needed).
+
+    Returns {endpoint_id: migrated} for endpoints that were migrated.
+    """
+    migrated: dict[str, bool] = {}
+    endpoint_names = {ep["conn_name"] for ep in endpoints}
+
+    for conn in client.get_connections():
+        if not is_our_gp_profile(conn):
+            continue
+        conn_id = conn.get_id()
+        if conn_id in endpoint_names:
+            continue  # already named after an endpoint — handled by CLEAN
+
+        gateway = profile_gateway(conn)
+        for ep in endpoints:
+            if gateway != ep["portal"].strip().lower():
+                continue
+            if client.get_connection_by_id(ep["conn_name"]) is not None:
+                print(
+                    f"  NOTE: legacy profile '{conn_id}' points at {ep['portal']} "
+                    f"but '{ep['conn_name']}' already exists — left untouched. "
+                    f"Delete it manually if it is redundant: "
+                    f"nmcli connection delete {conn_id}"
+                )
+                break
+            print(
+                f"  Migrating legacy profile '{conn_id}' "
+                f"(gateway={ep['portal']}) → renaming to '{ep['conn_name']}' "
+                f"(secrets preserved — no re-login needed)"
+            )
+            rename_connection(conn, ep["conn_name"])
+            migrated[ep["id"]] = True
+            break
+
+    return migrated
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Set up the NM VPN profile for smc-gp-vpn."
+        description="Set up the NM VPN profiles for smc-gp-vpn."
     )
     parser.add_argument(
         "--config",
@@ -212,21 +334,33 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config    = load_config(args.config)
-    conn_name = config.get("CONN_NAME", "SMC")
-    portal    = config.get("PORTAL",    "us-access.stagwellglobal.com")
+    config = load_config(args.config)
+    endpoints = parse_endpoints(config)
+    if not endpoints:
+        die("No endpoints found in config — run install.sh first.")
 
-    print(f"[NM setup] connection='{conn_name}'  portal='{portal}'")
+    for ep in endpoints:
+        print(f"[NM setup] endpoint '{ep['id']}': "
+              f"connection='{ep['conn_name']}'  portal='{ep['portal']}'")
 
     client = get_nm_client()
-    conn   = client.get_connection_by_id(conn_name)
 
-    if conn is None:
-        create_profile(client, conn_name, portal)
-    else:
-        clean_profile(conn, conn_name, portal)
+    migrated = migrate_legacy_profiles(client, endpoints)
 
-    print("[NM setup] Done. Run 'smc-vpn-refresh' to authenticate.")
+    for ep in endpoints:
+        conn_name = ep["conn_name"]
+        portal = ep["portal"]
+        conn = client.get_connection_by_id(conn_name)
+        if conn is None:
+            create_profile(client, conn_name, portal)
+        elif migrated.get(ep["id"]):
+            print(f"  Preserved '{conn_name}' — migrated legacy profile, "
+                  f"secrets kept.")
+        else:
+            clean_profile(conn, conn_name, portal)
+
+    print("[NM setup] Done. Run 'smc-vpn-refresh' to authenticate "
+          "(add --endpoint ID for a specific endpoint).")
 
 
 if __name__ == "__main__":

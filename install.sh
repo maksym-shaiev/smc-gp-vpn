@@ -5,15 +5,14 @@
 #
 # What this script does:
 #   1. Detects the distribution (Ubuntu / Arch-based incl. Omarchy)
-#   2. Checks prerequisites
-#   3. Selects the correct pre-built binary for the distribution
-#   4. Prompts for configuration (portal, connection name, browser)
-#   5. Writes ~/.config/smc-gp-vpn/config
-#   6. Downloads the gpclient-smc binary from the fork release and verifies SHA-256
-#   7. Installs gpclient-smc and smc-vpn-refresh to ~/.local/bin/
-#   8. Installs 99-smc-cookie-refresh dispatcher (requires sudo)
-#   9. Runs nm-profile-setup.py (creates or cleans the NM VPN profile)
-#  10. Prints next steps
+#   2. Checks prerequisites (incl. globalprotect-openconnect >= 3.3.0,
+#      which ships the upstream `--cookie-only` capability)
+#   3. Prompts for configuration (endpoints, portals, connection names, browser)
+#   4. Writes ~/.config/smc-gp-vpn/config (one NM profile per endpoint)
+#   5. Installs smc-vpn-refresh to ~/.local/bin/
+#   6. Installs 99-smc-cookie-refresh dispatcher (requires sudo)
+#   7. Runs nm-profile-setup.py (creates or cleans the NM VPN profiles)
+#   8. Prints next steps
 #
 # Usage:
 #   bash install.sh
@@ -21,11 +20,6 @@
 # Supported: Ubuntu 24.04 / 26.04, Arch-based distributions (incl. Omarchy)
 
 set -euo pipefail
-
-# ── release base URL ─────────────────────────────────────────────────────────
-# Update RELEASE_BASE when the upstream PR is merged and a new release is cut
-# from yuezk/GlobalProtect-openconnect.
-RELEASE_BASE="https://github.com/maksym-shaiev/GlobalProtect-openconnect/releases/download/gpclient-smc-latest"
 
 # ── paths ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,9 +29,18 @@ BIN_DIR="$HOME/.local/bin"
 DISPATCHER_DIR="/etc/NetworkManager/dispatcher.d"
 
 # ── defaults ─────────────────────────────────────────────────────────────────
-DEFAULT_PORTAL="us-access.stagwellglobal.com"
-DEFAULT_CONN_NAME="SMC"
+DEFAULT_ENDPOINTS="UK,US"
 DEFAULT_BROWSER="chrome"
+
+# Well-known portal defaults per endpoint id (unknown ids prompt empty and
+# fall back to the legacy PORTAL from a previous config, if any).
+known_portal_default() {
+    case "$1" in
+        UK) echo "uk-access.stagwellglobal.com" ;;
+        US) echo "us-access.stagwellglobal.com" ;;
+        *)  echo "" ;;
+    esac
+}
 
 # ── colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -79,7 +82,7 @@ info "Detected: ${PRETTY_NAME:-$DISTRO} (distro=$DISTRO)"
 section "Checking prerequisites"
 
 MISSING=()
-for cmd in python3 curl jq nmcli sudo notify-send; do
+for cmd in python3 nmcli sudo notify-send; do
     if ! command -v "$cmd" &>/dev/null; then
         MISSING+=("$cmd")
     fi
@@ -105,61 +108,31 @@ else
     fi
 fi
 
+# globalprotect-openconnect >= 3.3.0 — upstream gpclient with `--cookie-only`
+# (authenticates, prints COOKIE=/HOST=, exits without opening a tunnel).
+GPCLIENT=""
+if command -v gpclient &>/dev/null; then
+    GPCLIENT="$(command -v gpclient)"
+    if ! "$GPCLIENT" connect --help 2>&1 | grep -q -- '--cookie-only'; then
+        MISSING+=("globalprotect-openconnect >= 3.3.0 (${GPCLIENT} lacks --cookie-only; upgrade the package)")
+    fi
+else
+    if [[ "$DISTRO" == "ubuntu" ]]; then
+        MISSING+=("globalprotect-openconnect (install: sudo apt install globalprotect-openconnect)")
+    else
+        MISSING+=("globalprotect-openconnect (install: sudo pacman -S globalprotect-openconnect)")
+    fi
+fi
+
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     error "Missing prerequisites:"
     for m in "${MISSING[@]}"; do echo "    • $m"; done
     die "Install the above packages and re-run install.sh"
 fi
 
-info "All prerequisites satisfied"
+info "All prerequisites satisfied (gpclient: ${GPCLIENT})"
 
-# ── 3. resolve binary suffix ──────────────────────────────────────────────────
-section "Selecting binary for this system"
-
-case "$DISTRO" in
-    arch)
-        BINARY_SUFFIX="arch"
-        ;;
-    ubuntu)
-        if ! command -v lsb_release &>/dev/null; then
-            MISSING+=("lsb_release (install: sudo apt install lsb-release)")
-        fi
-        UBUNTU_VERSION=$(lsb_release -rs)
-        case "$UBUNTU_VERSION" in
-            24.04) BINARY_SUFFIX="ubuntu24.04" ;;
-            26.04) BINARY_SUFFIX="ubuntu26.04" ;;
-            *)
-                die "Unsupported Ubuntu version: $UBUNTU_VERSION\nSupported versions: 24.04, 26.04"
-                ;;
-        esac
-        info "Detected Ubuntu $UBUNTU_VERSION"
-        ;;
-esac
-
-# Each matrix job publishes its own checksum file to avoid race conditions
-# when parallel jobs upload to the same release.
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-SUMS_URL="${RELEASE_BASE}/SHA256SUMS-${BINARY_SUFFIX}"
-
-info "Fetching SHA256SUMS-${BINARY_SUFFIX} to resolve binary name …"
-curl -fsSL -o "$TMP_DIR/SHA256SUMS" "$SUMS_URL" \
-    || die "Failed to download SHA256SUMS from $SUMS_URL"
-
-BINARY_NAME=$(awk '{print $2}' "$TMP_DIR/SHA256SUMS" | grep '^gpclient-smc_' | head -1)
-AUTH_NAME=$(awk '{print $2}' "$TMP_DIR/SHA256SUMS" | grep '^gpauth-smc_' | head -1)
-if [[ -z "$BINARY_NAME" || -z "$AUTH_NAME" ]]; then
-    die "Could not resolve binary names from SHA256SUMS:\n$(cat "$TMP_DIR/SHA256SUMS")"
-fi
-
-BINARY_URL="${RELEASE_BASE}/${BINARY_NAME}"
-AUTH_URL="${RELEASE_BASE}/${AUTH_NAME}"
-info "Selected binaries:"
-echo "    gpclient: $BINARY_NAME"
-echo "    gpauth:   $AUTH_NAME"
-
-# ── 4. interactive configuration ─────────────────────────────────────────────
+# ── 3. interactive configuration ─────────────────────────────────────────────
 section "Configuration"
 
 prompt() {
@@ -169,77 +142,118 @@ prompt() {
     printf -v "$var" '%s' "$value"
 }
 
-prompt PORTAL    "Portal gateway"       "$DEFAULT_PORTAL"
-prompt CONN_NAME "NM connection name"   "$DEFAULT_CONN_NAME"
-prompt BROWSER   "Browser for CAS auth" "$DEFAULT_BROWSER"
+CONFIG_STATE=0   # 0 = no config, 1 = legacy single-endpoint, 2 = multi-endpoint
+LEGACY_PORTAL="" LEGACY_BROWSER=""
+if [[ -r "$CONFIG_FILE" ]]; then
+    if grep -q '^ENDPOINTS=' "$CONFIG_FILE"; then
+        CONFIG_STATE=2
+    else
+        CONFIG_STATE=1
+        LEGACY_PORTAL=$(awk -F= '$1=="PORTAL"{print $2}' "$CONFIG_FILE")
+        LEGACY_BROWSER=$(awk -F= '$1=="BROWSER"{print $2}' "$CONFIG_FILE")
+    fi
+fi
 
-echo
-info "Configuration:"
-echo "    PORTAL    = $PORTAL"
-echo "    CONN_NAME = $CONN_NAME"
-echo "    BROWSER   = $BROWSER"
+if [[ $CONFIG_STATE -eq 2 ]]; then
+    info "Using existing multi-endpoint config at $CONFIG_FILE"
+    grep -E '^(ENDPOINTS|DEFAULT_ENDPOINT|ENDPOINT_[A-Z0-9_]+_(PORTAL|CONN_NAME))=' "$CONFIG_FILE" \
+        | sed 's/^/    /'
+else
+    if [[ $CONFIG_STATE -eq 1 ]]; then
+        warn "Found legacy single-endpoint config — it will be upgraded to multi-endpoint."
+    fi
 
-# ── 5. write config ───────────────────────────────────────────────────────────
+    prompt EP_LIST  "Endpoints to configure (comma-separated ids)" "$DEFAULT_ENDPOINTS"
+    # Normalise: uppercase, keep [A-Z0-9_,] only, collapse duplicate commas
+    EP_LIST=$(echo "$EP_LIST" | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z0-9_,' | sed 's/,\+/,/g; s/^,//; s/,$//')
+    if [[ -z "$EP_LIST" ]]; then
+        die "At least one endpoint is required."
+    fi
+
+    BROWSER=""
+    prompt BROWSER "Browser for CAS auth" "${LEGACY_BROWSER:-$DEFAULT_BROWSER}"
+
+    EP_IDS=() EP_PORTALS=() EP_CONNS=() EP_CACHES=()
+    for eid in ${EP_LIST//,/ }; do
+        def_portal="$(known_portal_default "$eid")"
+        if [[ -z "$def_portal" && -n "$LEGACY_PORTAL" ]]; then
+            def_portal="$LEGACY_PORTAL"
+        fi
+        PORTAL=""
+        prompt PORTAL "Portal gateway for [$eid]" "$def_portal"
+        if [[ -z "$PORTAL" ]]; then
+            die "Portal for [$eid] is required."
+        fi
+        CONN_NAME=""
+        prompt CONN_NAME "NM connection name for [$eid]" "SMC-$eid"
+        if [[ -z "$CONN_NAME" ]]; then
+            die "Connection name for [$eid] is required."
+        fi
+        EP_IDS+=("$eid")
+        EP_PORTALS+=("$PORTAL")
+        EP_CONNS+=("$CONN_NAME")
+        EP_CACHES+=("$HOME/.config/gpclient/smc-cookie-$(echo "$eid" | tr '[:upper:]' '[:lower:]').json")
+    done
+
+    FIRST_EP="${EP_IDS[0]}"
+    DEFAULT_EP=""
+    prompt DEFAULT_EP "Default endpoint" "$FIRST_EP"
+    DEFAULT_EP=$(echo "$DEFAULT_EP" | tr '[:lower:]' '[:upper:]')
+    DEFAULT_EP="${DEFAULT_EP//[^A-Z0-9_]/}"
+    FOUND_DEFAULT=0
+    for eid in "${EP_IDS[@]}"; do
+        [[ "$eid" == "$DEFAULT_EP" ]] && FOUND_DEFAULT=1
+    done
+    if [[ $FOUND_DEFAULT -eq 0 ]]; then
+        die "Default endpoint '$DEFAULT_EP' is not in the endpoint list: ${EP_LIST}"
+    fi
+
+    echo
+    info "Configuration:"
+    echo "    BROWSER          = $BROWSER"
+    echo "    DEFAULT_ENDPOINT = $DEFAULT_EP"
+    for i in "${!EP_IDS[@]}"; do
+        echo "    [${EP_IDS[$i]}] portal=${EP_PORTALS[$i]}  conn=${EP_CONNS[$i]}"
+    done
+fi
+
+# ── 4. write config ──────────────────────────────────────────────────────────
 section "Writing config"
 
-mkdir -p "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
+if [[ $CONFIG_STATE -ne 2 ]]; then
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
 
-cat > "$CONFIG_FILE" <<EOF
-# smc-gp-vpn configuration
-# Generated by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+    {
+        echo "# smc-gp-vpn configuration"
+        echo "# Generated by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+        echo "BROWSER=$BROWSER"
+        echo "DEFAULT_ENDPOINT=$DEFAULT_EP"
+        echo "ENDPOINTS=$EP_LIST"
+        DEF_PORTAL="" DEF_CONN="" DEF_CACHE=""
+        for i in "${!EP_IDS[@]}"; do
+            echo "ENDPOINT_${EP_IDS[$i]}_PORTAL=${EP_PORTALS[$i]}"
+            echo "ENDPOINT_${EP_IDS[$i]}_CONN_NAME=${EP_CONNS[$i]}"
+            echo "ENDPOINT_${EP_IDS[$i]}_CACHE=${EP_CACHES[$i]}"
+            if [[ "${EP_IDS[$i]}" == "$DEFAULT_EP" ]]; then
+                DEF_PORTAL="${EP_PORTALS[$i]}"
+                DEF_CONN="${EP_CONNS[$i]}"
+                DEF_CACHE="${EP_CACHES[$i]}"
+            fi
+        done
+        # Legacy keys duplicated from the default endpoint — older tooling
+        # (previous widget versions, custom scripts) still reads PORTAL/CONN_NAME.
+        echo "PORTAL=$DEF_PORTAL"
+        echo "CONN_NAME=$DEF_CONN"
+        echo "CACHE=$DEF_CACHE"
+    } > "$CONFIG_FILE"
 
-PORTAL=$PORTAL
-CONN_NAME=$CONN_NAME
-BROWSER=$BROWSER
-GPCLIENT_BIN=$BIN_DIR/gpclient-smc
-GP_AUTH_BIN=$BIN_DIR/gpauth-smc
-CACHE=$HOME/.config/gpclient/smc-cookie.json
-EOF
-
-chmod 600 "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+fi
 info "Config written to $CONFIG_FILE"
 
-# ── 6. download binaries ──────────────────────────────────────────────────────
-section "Downloading gpclient-smc binaries"
-
-info "Downloading $BINARY_NAME …"
-curl -fsSL --progress-bar -o "$TMP_DIR/gpclient-smc" "$BINARY_URL" \
-    || die "Failed to download binary from $BINARY_URL"
-
-info "Downloading $AUTH_NAME …"
-curl -fsSL --progress-bar -o "$TMP_DIR/gpauth-smc" "$AUTH_URL" \
-    || die "Failed to download gpauth from $AUTH_URL"
-
-# ── 7. verify checksums ───────────────────────────────────────────────────────
-section "Verifying checksums"
-
-EXPECTED_CLIENT=$(awk -v n='gpclient-smc_' 'index($2, n) == 1 {print $1}' "$TMP_DIR/SHA256SUMS")
-ACTUAL_CLIENT=$(sha256sum "$TMP_DIR/gpclient-smc" | awk '{print $1}')
-if [[ "$EXPECTED_CLIENT" != "$ACTUAL_CLIENT" ]]; then
-    die "SHA-256 mismatch (gpclient-smc)!\n  expected: $EXPECTED_CLIENT\n  actual:   $ACTUAL_CLIENT"
-fi
-info "gpclient-smc verified: $ACTUAL_CLIENT"
-
-EXPECTED_AUTH=$(awk -v n='gpauth-smc_' 'index($2, n) == 1 {print $1}' "$TMP_DIR/SHA256SUMS")
-ACTUAL_AUTH=$(sha256sum "$TMP_DIR/gpauth-smc" | awk '{print $1}')
-if [[ "$EXPECTED_AUTH" != "$ACTUAL_AUTH" ]]; then
-    die "SHA-256 mismatch (gpauth-smc)!\n  expected: $EXPECTED_AUTH\n  actual:   $ACTUAL_AUTH"
-fi
-info "gpauth-smc verified: $ACTUAL_AUTH"
-
-# ── 8. install binaries ───────────────────────────────────────────────────────
-section "Installing gpclient-smc"
-
-mkdir -p "$BIN_DIR"
-install -m 755 "$TMP_DIR/gpclient-smc" "$BIN_DIR/gpclient-smc"
-info "Installed: $BIN_DIR/gpclient-smc"
-
-section "Installing gpauth-smc"
-
-install -m 755 "$TMP_DIR/gpauth-smc" "$BIN_DIR/gpauth-smc"
-info "Installed: $BIN_DIR/gpauth-smc"
-
+# ── 5. install smc-vpn-refresh ────────────────────────────────────────────────
 section "Installing smc-vpn-refresh"
 
 install -m 755 "$SCRIPT_DIR/scripts/smc-vpn-refresh" "$BIN_DIR/smc-vpn-refresh"
@@ -252,7 +266,7 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     warn '    export PATH="$HOME/.local/bin:$PATH"'
 fi
 
-# ── 9. install NM dispatcher ──────────────────────────────────────────────────
+# ── 6. install NM dispatcher ──────────────────────────────────────────────────
 section "Installing NM dispatcher (requires sudo)"
 
 sudo install -m 755 \
@@ -269,12 +283,12 @@ sudo ln -sf \
     "$DISPATCHER_DIR/pre-down.d/99-smc-cookie-refresh"
 info "Symlinked: $DISPATCHER_DIR/pre-down.d/99-smc-cookie-refresh"
 
-# ── 10. NM profile setup ──────────────────────────────────────────────────────
+# ── 7. NM profile setup ──────────────────────────────────────────────────────
 section "Setting up NetworkManager VPN profile"
 
 python3 "$SCRIPT_DIR/scripts/nm-profile-setup.py" --config "$CONFIG_FILE"
 
-# ── 11. Omarchy bar widget (Omarchy only) ────────────────────────────────────
+# ── 8. Omarchy bar widget (Omarchy only) ─────────────────────────────────────
 OMARCHY_WIDGET_URL="https://github.com/maksym-shaiev/gp-vpn-omarchy.git"
 
 IS_OMARCHY=0
@@ -303,6 +317,10 @@ fi
 # ── done ──────────────────────────────────────────────────────────────────────
 section "Installation complete"
 
+DEFAULT_EP_NAME=$(awk -F= '$1=="DEFAULT_ENDPOINT"{print $2}' "$CONFIG_FILE")
+DEFAULT_CONN=$(awk -F= '$1=="CONN_NAME"{print $2}' "$CONFIG_FILE")
+BROWSER=$(awk -F= '$1=="BROWSER"{print $2}' "$CONFIG_FILE")
+
 echo -e ""
 echo -e "${BOLD}Next step:${RESET}"
 echo -e ""
@@ -310,17 +328,26 @@ echo -e "  Run the following to authenticate and connect for the first time:"
 echo -e ""
 echo -e "    ${GREEN}smc-vpn-refresh${RESET}"
 echo -e ""
-echo -e "  This will open ${BROWSER} for CAS login, mint a gateway cookie,"
-echo -e "  write it to the '${CONN_NAME}' NM profile, and bring the VPN up."
+echo -e "  This will open ${BROWSER} for CAS login, mint a gateway cookie for the"
+echo -e "  default endpoint (${DEFAULT_EP_NAME}), write it to the '${DEFAULT_CONN}'"
+echo -e "  NM profile, and bring the VPN up."
 echo -e ""
 echo -e "${BOLD}Daily use:${RESET}"
 echo -e ""
-echo -e "  Flip the GNOME Network → VPN → ${CONN_NAME} toggle, or run:"
+echo -e "  Flip the GNOME Network → VPN → ${DEFAULT_CONN} toggle, or run:"
 echo -e ""
-echo -e "    nmcli connection up ${CONN_NAME}      # connect"
-echo -e "    nmcli connection down ${CONN_NAME}    # disconnect"
+echo -e "    nmcli connection up ${DEFAULT_CONN}      # connect"
+echo -e "    nmcli connection down ${DEFAULT_CONN}    # disconnect"
 echo -e ""
 echo -e "  No dialog will appear. The cookie auto-refreshes on disconnect."
+echo -e ""
+echo -e "${BOLD}Switching endpoints:${RESET}"
+echo -e ""
+echo -e "  Authenticate and connect another endpoint:"
+echo -e ""
+echo -e "    ${GREEN}smc-vpn-refresh --endpoint UK${RESET}   (or US, or any configured id)"
+echo -e ""
+echo -e "  On Omarchy, the bar widget's popup has an endpoint selector."
 echo -e ""
 echo -e "${BOLD}When the VPN stops connecting (portal session expired):${RESET}"
 echo -e ""

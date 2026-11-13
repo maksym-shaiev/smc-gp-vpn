@@ -2,17 +2,22 @@
 """
 smc-vpn-refresh — refresh the VPN gateway cookie and reconnect.
 
-Usage:  smc-vpn-refresh [--browser chrome|firefox|auto] [--no-connect]
+Usage:  smc-vpn-refresh [--endpoint ID] [--browser chrome|firefox|auto] [--no-connect]
 
 Flow:
-  1. Load config from ~/.config/smc-gp-vpn/config
-  2. Run gpclient-smc --print-cookie --cookie-cache <cache>
+  1. Load config from ~/.config/smc-gp-vpn/config and resolve the endpoint
+     (--endpoint wins, else the only endpoint, else the currently active one,
+     else DEFAULT_ENDPOINT).
+  2. Run gpclient --cookie-only --cookie-cache <endpoint cache>
        - Reuses the cached portal-userauthcookie if still valid (no browser).
        - Falls back to browser login when the portal session has expired.
-  3. Parse COOKIE= / HOST= from stdout.
-  4. Write cookie + gateway + gwcert='' to the NM profile via the NM
-     Python binding (gwcert='' satisfies need_secrets() without pinning).
-  5. Bring the VPN down then up again (unless --no-connect).
+  3. Parse COOKIE= / HOST= from stdout (shell-quoted by gpclient >= 3.0).
+  4. Write cookie + gateway + gwcert='' to the endpoint's NM profile via the
+     NM Python binding (gwcert='' satisfies need_secrets() without pinning).
+  5. Bring the VPN down then up again (unless --no-connect). Any other
+     configured endpoint that is still connected is brought down first —
+     CAS portals only honour one live session per user, so keeping a second
+     tunnel up would invalidate the first cookie anyway.
 
 Why not nmcli for secret writes:
   The gateway authcookie contains '&' and '=' characters that nmcli's
@@ -22,6 +27,7 @@ Why not nmcli for secret writes:
 
 import argparse
 import os
+import shutil
 import sys
 import time
 import subprocess
@@ -52,11 +58,98 @@ def load_config(path: str) -> dict:
     return config
 
 
+def parse_endpoints(config: dict) -> list[dict]:
+    """Parse ENDPOINT_* entries from config; fall back to legacy single-endpoint keys.
+
+    Each endpoint is a dict: {id, portal, conn_name, cache}.
+    """
+    endpoints: list[dict] = []
+    for eid in (s.strip().upper() for s in config.get("ENDPOINTS", "").split(",")):
+        if not eid or not eid.replace("_", "").isalnum():
+            continue
+        portal = config.get(f"ENDPOINT_{eid}_PORTAL", "")
+        conn = config.get(f"ENDPOINT_{eid}_CONN_NAME", "")
+        if not portal or not conn:
+            continue
+        cache = config.get(
+            f"ENDPOINT_{eid}_CACHE",
+            os.path.expanduser(f"~/.config/gpclient/smc-cookie-{eid.lower()}.json"),
+        )
+        endpoints.append({"id": eid, "portal": portal, "conn_name": conn, "cache": cache})
+
+    if endpoints:
+        return endpoints
+
+    # Legacy single-endpoint config (written by older install.sh versions).
+    portal = config.get("PORTAL", "")
+    if portal:
+        return [{
+            "id": "MAIN",
+            "portal": portal,
+            "conn_name": config.get("CONN_NAME", "SMC"),
+            "cache": config.get(
+                "CACHE", os.path.expanduser("~/.config/gpclient/smc-cookie.json")
+            ),
+        }]
+    return []
+
+
+def default_endpoint(config: dict, endpoints: list[dict]) -> dict | None:
+    want = config.get("DEFAULT_ENDPOINT", "").strip().upper()
+    for ep in endpoints:
+        if ep["id"] == want:
+            return ep
+    return endpoints[0] if endpoints else None
+
+
+def active_conn_names() -> set[str]:
+    out = subprocess.run(
+        ["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"],
+        capture_output=True, text=True,
+    ).stdout
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+def resolve_endpoint(
+    config: dict, endpoints: list[dict], wanted: str | None
+) -> dict:
+    """Explicit --endpoint wins, else the only endpoint, else the active one,
+    else DEFAULT_ENDPOINT."""
+    if wanted:
+        want = wanted.strip().upper()
+        for ep in endpoints:
+            if ep["id"] == want:
+                return ep
+        known = ", ".join(ep["id"] for ep in endpoints)
+        die(f"Unknown endpoint '{wanted}'. Configured endpoints: {known}")
+
+    if len(endpoints) == 1:
+        return endpoints[0]
+
+    active = active_conn_names()
+    for ep in endpoints:
+        if ep["conn_name"] in active:
+            return ep
+
+    ep = default_endpoint(config, endpoints)
+    if ep is None:
+        die("No endpoints configured — run install.sh first.")
+    return ep
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def unquote(v: str) -> str:
+    """gpclient >= 3.0 prints COOKIE='<value>' / HOST='<value>' with literal
+    shell-style quotes (the output is designed to be eval-ed). Strip them."""
+    if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+        return v[1:-1]
+    return v
 
 
 def pump_loop(ms: int = 700) -> None:
@@ -67,19 +160,22 @@ def pump_loop(ms: int = 700) -> None:
 
 # ── step 1 — get cookie ──────────────────────────────────────────────────────
 
-def get_cookie(config: dict, browser: str) -> tuple[str, str]:
-    """Run gpclient-smc --print-cookie and return (COOKIE, HOST)."""
+def get_cookie(config: dict, endpoint: dict, browser: str) -> tuple[str, str]:
+    """Run gpclient --cookie-only and return (COOKIE, HOST)."""
     gpclient = config.get("GPCLIENT_BIN",
-                          os.path.expanduser("~/.local/bin/gpclient-smc"))
-    cache    = config.get("CACHE",
-                          os.path.expanduser("~/.config/gpclient/smc-cookie.json"))
-    portal   = config.get("PORTAL", "us-access.stagwellglobal.com")
+                          shutil.which("gpclient") or "/usr/bin/gpclient")
+    cache = endpoint["cache"]
+    portal = endpoint["portal"]
 
     cmd = [
         gpclient, "connect", portal,
         "--browser", browser,
         "--cookie-cache", cache,
-        "--print-cookie",
+        "--cookie-only",
+        # Pick a gateway automatically — smc-vpn-refresh often runs without a
+        # TTY (widget buttons, NM dispatcher), where the interactive gateway
+        # prompt would abort with "The input device is not a TTY".
+        "--auto-gateway",
     ]
     # Force gpclient to use our gpauth (same tree as gpclient-smc) instead of
     # the system /usr/bin/gpauth, whose CLI may not match (e.g. --host-id).
@@ -90,32 +186,35 @@ def get_cookie(config: dict, browser: str) -> tuple[str, str]:
     elif gpauth:
         print(f"    gpauth not found at {gpauth} — falling back to system gpauth",
               flush=True)
-    print(f"[1/4] Running: {' '.join(cmd)}", flush=True)
+    print(
+        f"[1/4] [{endpoint['id']}] Running: {' '.join(cmd)}",
+        flush=True,
+    )
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=300, env=env)
     except FileNotFoundError:
-        die(f"gpclient-smc not found at {gpclient}")
+        die(f"gpclient not found at {gpclient}")
     except subprocess.TimeoutExpired:
-        die("gpclient-smc timed out after 5 minutes")
+        die("gpclient timed out after 5 minutes")
 
     cookie = host = ""
     for line in result.stdout.splitlines():
         if line.startswith("COOKIE="):
-            cookie = line[len("COOKIE="):]
+            cookie = unquote(line[len("COOKIE="):])
         elif line.startswith("HOST="):
-            host = line[len("HOST="):]
+            host = unquote(line[len("HOST="):])
 
     if result.returncode != 0 and not cookie:
         print(result.stderr[-2000:], file=sys.stderr)
-        die(f"gpclient-smc exited {result.returncode} and returned no cookie")
+        die(f"gpclient exited {result.returncode} and returned no cookie")
 
     if not cookie.startswith("authcookie="):
         die(f"Unexpected cookie format (len={len(cookie)}): {cookie[:60]!r}")
 
     if not host:
-        die("gpclient-smc returned no HOST")
+        die("gpclient returned no HOST")
 
     print(f"    cookie length: {len(cookie)}  host: {host}", flush=True)
     return cookie, host
@@ -123,14 +222,14 @@ def get_cookie(config: dict, browser: str) -> tuple[str, str]:
 
 # ── step 2 — write NM secrets ────────────────────────────────────────────────
 
-def write_nm_secrets(config: dict, cookie: str, host: str) -> None:
+def write_nm_secrets(endpoint: dict, cookie: str, host: str) -> None:
     """Write cookie / gateway / gwcert into the NM profile via D-Bus."""
-    conn_name = config.get("CONN_NAME", "SMC")
-    print(f"[2/4] Writing secrets to NetworkManager connection '{conn_name}' …",
-          flush=True)
+    conn_name = endpoint["conn_name"]
+    print(f"[2/4] [{endpoint['id']}] Writing secrets to NetworkManager "
+          f"connection '{conn_name}' …", flush=True)
 
     client = NM.Client.new(None)
-    conn   = client.get_connection_by_id(conn_name)
+    conn = client.get_connection_by_id(conn_name)
     if conn is None:
         die(f"NetworkManager connection '{conn_name}' not found.\n"
             f"Run install.sh to create it.")
@@ -154,9 +253,21 @@ def write_nm_secrets(config: dict, cookie: str, host: str) -> None:
 
 # ── step 3 — reconnect ───────────────────────────────────────────────────────
 
-def reconnect(config: dict) -> None:
-    conn_name = config.get("CONN_NAME", "SMC")
-    print(f"[3/4] Reconnecting '{conn_name}' …", flush=True)
+def reconnect(endpoints: list[dict], endpoint: dict) -> None:
+    conn_name = endpoint["conn_name"]
+    print(f"[3/4] [{endpoint['id']}] Reconnecting '{conn_name}' …", flush=True)
+
+    # Bring down any other configured endpoint that is still connected.
+    # CAS portals only honour one live session per user — a second login
+    # invalidates the first portal cookie, so a stale second tunnel is worse
+    # than no second tunnel.
+    active = active_conn_names()
+    for ep in endpoints:
+        if ep["conn_name"] != conn_name and ep["conn_name"] in active:
+            print(f"    bringing down other endpoint '{ep['conn_name']}' …",
+                  flush=True)
+            subprocess.run(["nmcli", "connection", "down", ep["conn_name"]],
+                           capture_output=True)
 
     # Down — ignore errors (connection may already be inactive)
     subprocess.run(
@@ -208,6 +319,12 @@ def main() -> None:
         description="Refresh the VPN gateway cookie and reconnect via NetworkManager."
     )
     parser.add_argument(
+        "--endpoint",
+        default=None,
+        help="Endpoint id from the config (e.g. UK, US). Default: the only "
+             "endpoint, else the currently active one, else DEFAULT_ENDPOINT.",
+    )
+    parser.add_argument(
         "--browser",
         default=None,
         choices=["chrome", "firefox", "auto"],
@@ -226,16 +343,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config  = load_config(args.config)
+    config = load_config(args.config)
+    endpoints = parse_endpoints(config)
+    if not endpoints:
+        die("No endpoints found in config — run install.sh first.")
+
+    endpoint = resolve_endpoint(config, endpoints, args.endpoint)
     browser = args.browser or config.get("BROWSER", "chrome")
 
-    cookie, host = get_cookie(config, browser)
-    write_nm_secrets(config, cookie, host)
+    cookie, host = get_cookie(config, endpoint, browser)
+    write_nm_secrets(endpoint, cookie, host)
 
     if args.no_connect:
         print("Secrets updated. Skipping reconnect (--no-connect).", flush=True)
     else:
-        reconnect(config)
+        reconnect(endpoints, endpoint)
         verify()
 
 
