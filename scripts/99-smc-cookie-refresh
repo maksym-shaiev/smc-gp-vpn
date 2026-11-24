@@ -77,12 +77,20 @@ def find_config() -> tuple[str, dict]:
     return "", {}, None
 
 
+def as_gateway_flag(config: dict, eid: str) -> bool:
+    """True when ENDPOINT_<ID>_AS_GATEWAY enables gateway-mode auth."""
+    return config.get(f"ENDPOINT_{eid}_AS_GATEWAY", "").strip().lower() in (
+        "1", "yes", "true", "y", "on",
+    )
+
+
 def parse_endpoints(config: dict, home_dir: str) -> list[dict]:
     """Parse ENDPOINT_* entries from config; fall back to legacy single-endpoint keys.
 
     Mirrors parse_endpoints() in smc-vpn-refresh / nm-profile-setup.py.
-    Each endpoint is a dict: {id, portal, conn_name, cache}. home_dir is the
-    invoking user's home (the dispatcher runs as root, so ~ is /root).
+    Each endpoint is a dict: {id, portal, conn_name, cache, as_gateway}.
+    home_dir is the invoking user's home (the dispatcher runs as root, so
+    ~ is /root).
     """
     endpoints: list[dict] = []
     for eid in (s.strip().upper() for s in config.get("ENDPOINTS", "").split(",")):
@@ -96,7 +104,13 @@ def parse_endpoints(config: dict, home_dir: str) -> list[dict]:
             f"ENDPOINT_{eid}_CACHE",
             os.path.join(home_dir, f".config/gpclient/smc-cookie-{eid.lower()}.json"),
         )
-        endpoints.append({"id": eid, "portal": portal, "conn_name": conn, "cache": cache})
+        endpoints.append({
+            "id": eid,
+            "portal": portal,
+            "conn_name": conn,
+            "cache": cache,
+            "as_gateway": as_gateway_flag(config, eid),
+        })
 
     if endpoints:
         return endpoints
@@ -109,6 +123,7 @@ def parse_endpoints(config: dict, home_dir: str) -> list[dict]:
             "portal": portal,
             "conn_name": config.get("CONN_NAME", "SMC"),
             "cache": config.get("CACHE", ""),
+            "as_gateway": False,
         }]
     return []
 
@@ -292,6 +307,18 @@ def main() -> None:
         sys.exit(0)
 
     conn_name = endpoint["conn_name"]
+
+    # Gateway-mode endpoints authenticate directly against the gateway
+    # (--as-gateway): CAS never issues a reusable portal session for them,
+    # so a silent refresh cannot mint a cookie — it could only open a
+    # browser on every disconnect. Skip; the next toggle-on fails visibly
+    # and the user runs the widget's Authenticate button when needed.
+    if endpoint.get("as_gateway"):
+        log(f"[{endpoint['id']}] {conn_name} {action} on {iface} — "
+            f"gateway-mode endpoint: no reusable portal session, "
+            f"skipping refresh")
+        sys.exit(0)
+
     log(f"[{endpoint['id']}] {conn_name} {action} on {iface} — refreshing gateway cookie")
 
     result = get_fresh_cookie(config, endpoint, pw)
@@ -300,7 +327,8 @@ def main() -> None:
         notify(
             pw,
             f"{conn_name} VPN — re-authentication required",
-            "The portal session has expired. Run `smc-vpn-refresh` to log in again.",
+            "The portal session has expired. Use the VPN widget's "
+            "Authenticate button (or run `smc-vpn-refresh`) to log in again.",
         )
         sys.exit(0)
 

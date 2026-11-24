@@ -8,9 +8,15 @@ Flow:
   1. Load config from ~/.config/smc-gp-vpn/config and resolve the endpoint
      (--endpoint wins, else the only endpoint, else the currently active one,
      else DEFAULT_ENDPOINT).
-  2. Run gpclient --cookie-only --cookie-cache <endpoint cache>
-       - Reuses the cached portal-userauthcookie if still valid (no browser).
-       - Falls back to browser login when the portal session has expired.
+  2. Run gpclient --cookie-only
+       - Portal mode (default): --cookie-cache <endpoint cache> reuses the
+         cached portal-userauthcookie if still valid (no browser) and falls
+         back to browser login when it has expired; --auto-gateway picks the
+         gateway without a TTY prompt.
+       - Gateway mode (ENDPOINT_<ID>_AS_GATEWAY=yes): --as-gateway
+         authenticates directly against the gateway. CAS gateways that
+         reject the portal result would otherwise force a second browser
+         login (e.g. UK); gateway mode needs exactly one.
   3. Parse COOKIE= / HOST= from stdout (shell-quoted by gpclient >= 3.0).
   4. Write cookie + gateway + gwcert='' to the endpoint's NM profile via the
      NM Python binding (gwcert='' satisfies need_secrets() without pinning).
@@ -58,10 +64,17 @@ def load_config(path: str) -> dict:
     return config
 
 
+def as_gateway_flag(config: dict, eid: str) -> bool:
+    """True when ENDPOINT_<ID>_AS_GATEWAY enables gateway-mode auth."""
+    return config.get(f"ENDPOINT_{eid}_AS_GATEWAY", "").strip().lower() in (
+        "1", "yes", "true", "y", "on",
+    )
+
+
 def parse_endpoints(config: dict) -> list[dict]:
     """Parse ENDPOINT_* entries from config; fall back to legacy single-endpoint keys.
 
-    Each endpoint is a dict: {id, portal, conn_name, cache}.
+    Each endpoint is a dict: {id, portal, conn_name, cache, as_gateway}.
     """
     endpoints: list[dict] = []
     for eid in (s.strip().upper() for s in config.get("ENDPOINTS", "").split(",")):
@@ -75,7 +88,13 @@ def parse_endpoints(config: dict) -> list[dict]:
             f"ENDPOINT_{eid}_CACHE",
             os.path.expanduser(f"~/.config/gpclient/smc-cookie-{eid.lower()}.json"),
         )
-        endpoints.append({"id": eid, "portal": portal, "conn_name": conn, "cache": cache})
+        endpoints.append({
+            "id": eid,
+            "portal": portal,
+            "conn_name": conn,
+            "cache": cache,
+            "as_gateway": as_gateway_flag(config, eid),
+        })
 
     if endpoints:
         return endpoints
@@ -90,6 +109,7 @@ def parse_endpoints(config: dict) -> list[dict]:
             "cache": config.get(
                 "CACHE", os.path.expanduser("~/.config/gpclient/smc-cookie.json")
             ),
+            "as_gateway": False,
         }]
     return []
 
@@ -170,13 +190,25 @@ def get_cookie(config: dict, endpoint: dict, browser: str) -> tuple[str, str]:
     cmd = [
         gpclient, "connect", portal,
         "--browser", browser,
-        "--cookie-cache", cache,
         "--cookie-only",
-        # Pick a gateway automatically — smc-vpn-refresh often runs without a
-        # TTY (widget buttons, NM dispatcher), where the interactive gateway
-        # prompt would abort with "The input device is not a TTY".
-        "--auto-gateway",
     ]
+    if endpoint.get("as_gateway"):
+        # Gateway-mode endpoint: CAS accepts the portal login but rejects its
+        # result at the gateway ("Gateway login error"), which triggers a
+        # second browser login. Authenticate straight against the gateway —
+        # one login, and the returned cookie is the gateway cookie NM needs.
+        # No --cookie-cache: gateway CAS auth yields no reusable portal
+        # session to cache (verified: gpclient writes no cache file).
+        cmd.append("--as-gateway")
+    else:
+        cmd += [
+            "--cookie-cache", cache,
+            # Pick a gateway automatically — smc-vpn-refresh often runs
+            # without a TTY (widget buttons, NM dispatcher), where the
+            # interactive gateway prompt would abort with
+            # "The input device is not a TTY".
+            "--auto-gateway",
+        ]
     # Force gpclient to use our gpauth (same tree as gpclient-smc) instead of
     # the system /usr/bin/gpauth, whose CLI may not match (e.g. --host-id).
     env = os.environ.copy()

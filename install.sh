@@ -42,6 +42,16 @@ known_portal_default() {
     esac
 }
 
+# Gateway-mode default per endpoint id: CAS gateways that reject the portal
+# login result at the gateway (forcing a second browser login) authenticate
+# directly against the gateway instead (--as-gateway). UK does; US doesn't.
+known_as_gateway_default() {
+    case "$1" in
+        UK) echo "yes" ;;
+        *)  echo "no" ;;
+    esac
+}
+
 # ── colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BOLD='\033[1m'; RESET='\033[0m'
@@ -156,7 +166,7 @@ fi
 
 if [[ $CONFIG_STATE -eq 2 ]]; then
     info "Using existing multi-endpoint config at $CONFIG_FILE"
-    grep -E '^(ENDPOINTS|DEFAULT_ENDPOINT|ENDPOINT_[A-Z0-9_]+_(PORTAL|CONN_NAME))=' "$CONFIG_FILE" \
+    grep -E '^(ENDPOINTS|DEFAULT_ENDPOINT|ENDPOINT_[A-Z0-9_]+_(PORTAL|CONN_NAME|AS_GATEWAY))=' "$CONFIG_FILE" \
         | sed 's/^/    /'
 else
     if [[ $CONFIG_STATE -eq 1 ]]; then
@@ -173,7 +183,7 @@ else
     BROWSER=""
     prompt BROWSER "Browser for CAS auth" "${LEGACY_BROWSER:-$DEFAULT_BROWSER}"
 
-    EP_IDS=() EP_PORTALS=() EP_CONNS=() EP_CACHES=()
+    EP_IDS=() EP_PORTALS=() EP_CONNS=() EP_CACHES=() EP_ASGW=()
     for eid in ${EP_LIST//,/ }; do
         def_portal="$(known_portal_default "$eid")"
         if [[ -z "$def_portal" && -n "$LEGACY_PORTAL" ]]; then
@@ -193,6 +203,7 @@ else
         EP_PORTALS+=("$PORTAL")
         EP_CONNS+=("$CONN_NAME")
         EP_CACHES+=("$HOME/.config/gpclient/smc-cookie-$(echo "$eid" | tr '[:upper:]' '[:lower:]').json")
+        EP_ASGW+=("$(known_as_gateway_default "$eid")")
     done
 
     FIRST_EP="${EP_IDS[0]}"
@@ -213,7 +224,7 @@ else
     echo "    BROWSER          = $BROWSER"
     echo "    DEFAULT_ENDPOINT = $DEFAULT_EP"
     for i in "${!EP_IDS[@]}"; do
-        echo "    [${EP_IDS[$i]}] portal=${EP_PORTALS[$i]}  conn=${EP_CONNS[$i]}"
+        echo "    [${EP_IDS[$i]}] portal=${EP_PORTALS[$i]}  conn=${EP_CONNS[$i]}  gateway-auth=${EP_ASGW[$i]}"
     done
 fi
 
@@ -236,6 +247,7 @@ if [[ $CONFIG_STATE -ne 2 ]]; then
             echo "ENDPOINT_${EP_IDS[$i]}_PORTAL=${EP_PORTALS[$i]}"
             echo "ENDPOINT_${EP_IDS[$i]}_CONN_NAME=${EP_CONNS[$i]}"
             echo "ENDPOINT_${EP_IDS[$i]}_CACHE=${EP_CACHES[$i]}"
+            echo "ENDPOINT_${EP_IDS[$i]}_AS_GATEWAY=${EP_ASGW[$i]}"
             if [[ "${EP_IDS[$i]}" == "$DEFAULT_EP" ]]; then
                 DEF_PORTAL="${EP_PORTALS[$i]}"
                 DEF_CONN="${EP_CONNS[$i]}"
@@ -250,8 +262,26 @@ if [[ $CONFIG_STATE -ne 2 ]]; then
     } > "$CONFIG_FILE"
 
     chmod 600 "$CONFIG_FILE"
+else
+    # Existing multi-endpoint config — append gateway-mode defaults for
+    # endpoints written before ENDPOINT_<ID>_AS_GATEWAY existed. Existing
+    # keys (and cookies) are left untouched.
+    _updated=0
+    while IFS= read -r eid; do
+        eid="$(echo "$eid" | tr -cd 'A-Z0-9_')"
+        [[ -z "$eid" ]] && continue
+        if ! grep -q "^ENDPOINT_${eid}_AS_GATEWAY=" "$CONFIG_FILE"; then
+            _asgw="$(known_as_gateway_default "$eid")"
+            echo "ENDPOINT_${eid}_AS_GATEWAY=$_asgw" >> "$CONFIG_FILE"
+            info "Added ENDPOINT_${eid}_AS_GATEWAY=$_asgw"
+            _updated=1
+        fi
+    done < <(awk -F= '$1=="ENDPOINTS"{print $2}' "$CONFIG_FILE" | tr ',' '\n')
+    if [[ $_updated -eq 1 ]]; then
+        chmod 600 "$CONFIG_FILE"
+    fi
 fi
-info "Config written to $CONFIG_FILE"
+info "Config ready at $CONFIG_FILE"
 
 # ── 5. install smc-vpn-refresh ────────────────────────────────────────────────
 section "Installing smc-vpn-refresh"

@@ -70,8 +70,10 @@ per endpoint, the portal and NM connection name:
 It requires `sudo` once — only to install the NM dispatcher script into
 `/etc/NetworkManager/dispatcher.d/`.
 
-An existing multi-endpoint config is reused as-is; a legacy single-endpoint
-config is upgraded to the multi-endpoint format on re-run.
+An existing multi-endpoint config is reused as-is (missing
+`ENDPOINT_<ID>_AS_GATEWAY` keys are appended with defaults — UK `yes`,
+others `no`); a legacy single-endpoint config is upgraded to the
+multi-endpoint format on re-run.
 
 ### First-time authentication
 
@@ -102,9 +104,11 @@ ENDPOINTS=UK,US
 ENDPOINT_UK_PORTAL=uk-access.stagwellglobal.com
 ENDPOINT_UK_CONN_NAME=SMC-UK
 ENDPOINT_UK_CACHE=~/.config/gpclient/smc-cookie-uk.json
+ENDPOINT_UK_AS_GATEWAY=yes
 ENDPOINT_US_PORTAL=us-access.stagwellglobal.com
 ENDPOINT_US_CONN_NAME=SMC-US
 ENDPOINT_US_CACHE=~/.config/gpclient/smc-cookie-us.json
+ENDPOINT_US_AS_GATEWAY=no
 # Legacy keys duplicated from the default endpoint (older tooling reads them):
 PORTAL=uk-access.stagwellglobal.com
 CONN_NAME=SMC-UK
@@ -114,6 +118,28 @@ CACHE=~/.config/gpclient/smc-cookie-uk.json
 `GPCLIENT_BIN` / `GP_AUTH_BIN` are optional overrides for setups that use a
 custom gpclient build (e.g. the pre-3.3.0 fork); by default the `gpclient`
 found on `PATH` is used.
+
+### Gateway-mode endpoints (`ENDPOINT_<ID>_AS_GATEWAY`)
+
+Set `ENDPOINT_<ID>_AS_GATEWAY=yes` for endpoints whose CAS gateway rejects
+the portal login result. Without the flag, `smc-vpn-refresh` authenticates
+against the portal first and passes that result to the gateway; a gateway
+that rejects it falls back to gateway prelogin and opens the browser a
+**second** time (observed on `uk-access`). With the flag, `gpclient` runs
+with `--as-gateway` and authenticates directly against the gateway —
+exactly one browser login.
+
+Consequences for gateway-mode endpoints:
+
+- The portal login result is never reused, so no portal-cookie cache is
+  written and every refresh opens the browser.
+- The dispatcher (`99-smc-cookie-refresh`) skips the silent background
+  refresh for them — it cannot mint a cookie without a browser. When the
+  cookie expires, the next toggle-on fails and you re-authenticate via the
+  widget's **Authenticate** button (or `smc-vpn-refresh --endpoint <ID>`).
+
+`install.sh` defaults UK to `yes` and every other endpoint to `no`; re-running
+it appends the key for endpoints written before this option existed.
 
 Switching endpoints from the terminal:
 
@@ -151,8 +177,10 @@ nmcli connection down SMC-UK    # disconnect
 ```
 
 When the VPN disconnects, the dispatcher script (`99-smc-cookie-refresh`)
-automatically mints a fresh gateway cookie in the background (~1–2 s). The
-toggle is ready to use again immediately.
+automatically mints a fresh gateway cookie in the background (~1–2 s), so the
+toggle is ready to use again immediately. Gateway-mode endpoints are skipped
+(see `ENDPOINT_<ID>_AS_GATEWAY` above) — their cookie can only be refreshed
+with a browser login.
 
 Monitor the refresh in real time:
 
@@ -173,6 +201,10 @@ smc-vpn-refresh --endpoint UK      # ... for a specific endpoint
 smc-vpn-refresh --no-connect       # update secrets only, no reconnect
 smc-vpn-refresh --browser firefox  # use Firefox instead of Chrome
 ```
+
+Gateway-mode endpoints (`ENDPOINT_<ID>_AS_GATEWAY=yes`, UK by default) always
+open the browser for a fresh login here — their CAS gateway does not issue a
+reusable portal session, so there is nothing to auto-refresh.
 
 ---
 
