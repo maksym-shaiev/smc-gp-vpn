@@ -32,8 +32,10 @@ Why not nmcli for secret writes:
 """
 
 import argparse
+import json
 import os
 import shutil
+import signal
 import sys
 import time
 import subprocess
@@ -45,6 +47,145 @@ from gi.repository import NM, GLib  # noqa: E402
 CONFIG_PATH = os.path.expanduser("~/.config/smc-gp-vpn/config")
 
 CONNECT_UP_WAIT = 15  # seconds to wait for 'activated'
+
+# ── live-run state file ──────────────────────────────────────────────────────
+# While a refresh runs, refresh.json in the user's runtime dir records
+# {pid, endpoint, connName, step, started}. The omarchy widget's status
+# helper reads it so a sign-in started from a terminal shows up in the bar
+# too, and Cancel can SIGTERM the exact pid. Removed on every exit path;
+# refresh-last.json records how the run ended so the widget can report the
+# outcome of runs it did not start itself.
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+    "smc-gp-vpn",
+)
+STATE_PATH = os.path.join(STATE_DIR, "refresh.json")
+LAST_PATH = os.path.join(STATE_DIR, "refresh-last.json")
+
+_state: dict = {"pid": os.getpid(), "endpoint": "", "connName": "", "started": 0}
+_child: subprocess.Popen | None = None
+_error_text: str = ""
+
+
+def state_write(step: str) -> None:
+    _state["step"] = step
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = f"{STATE_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(_state, f)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass  # state file is best-effort
+
+
+def state_clear(last_exit: int | None = None) -> None:
+    # Record the outcome before removing the live file: the widget matches
+    # on pid to tell a finished run it was watching from an older one.
+    if last_exit is not None:
+        try:
+            payload = {
+                "pid": os.getpid(),
+                "endpoint": _state.get("endpoint", ""),
+                "exit": last_exit,
+            }
+            if last_exit not in (0, 130) and _error_text:
+                payload["error"] = _error_text
+            tmp = f"{LAST_PATH}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, LAST_PATH)
+        except OSError:
+            pass
+    try:
+        os.unlink(STATE_PATH)
+    except OSError:
+        pass
+
+
+def _existing_run() -> dict | None:
+    """A live refresh recorded in the state file (pid still alive)."""
+    try:
+        with open(STATE_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    pid = data.get("pid", 0)
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None  # stale file from a crashed run
+    except PermissionError:
+        pass  # pid exists — treat as alive
+    return data
+
+
+def _child_pids(parent_pid: int) -> list[int]:
+    """Direct children of a process, gathered from EVERY thread.
+
+    /proc/<pid>/task/<tid>/children lists children per thread; gpclient is
+    multi-threaded (Rust/tokio) and may have spawned gpauth from a worker
+    thread, so checking only the main thread can miss it.
+    """
+    kids: list[int] = []
+    try:
+        tids = os.listdir(f"/proc/{parent_pid}/task")
+    except OSError:
+        return kids
+    for tid in tids:
+        try:
+            with open(f"/proc/{parent_pid}/task/{tid}/children") as f:
+                kids += [int(p) for p in f.read().split()]
+        except (OSError, ValueError):
+            continue
+    return sorted(set(kids))
+
+
+def _kill_child_tree() -> None:
+    """SIGTERM gpclient and its direct children (gpauth).
+
+    Never signal the process group: gpauth spawns the browser via
+    webbrowser/xdg-open, and the spawned browser usually stays in gpclient's
+    process group — a group-wide SIGTERM would close the user's whole
+    browser session. Signalling gpclient + gpauth by pid kills the login
+    flow cleanly while the browser window stays open (its callback is dead,
+    which is exactly what Cancel means).
+    """
+    if _child is None:
+        return
+    targets = [_child.pid] + _child_pids(_child.pid)
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+
+
+_post_auth_signals = 0
+
+
+def _on_cancel_signal(signum, _frame) -> None:
+    """SIGTERM/SIGINT (e.g. the widget's Cancel).
+
+    During the auth step: stop gpclient/gpauth, exit 130. Past it (secrets
+    written, tunnel being reconnected) cancelling could leave the VPN down,
+    so the first signal is ignored with a note; a repeated signal restores
+    the default disposition and kills the process for real.
+    """
+    if _state.get("step") == "auth":
+        _kill_child_tree()
+        print("Cancelled.", flush=True)
+        sys.exit(130)
+    global _post_auth_signals
+    _post_auth_signals += 1
+    if _post_auth_signals == 1:
+        print("Cancel ignored — sign-in finished, reconnect in progress.",
+              file=sys.stderr, flush=True)
+        return
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -122,6 +263,71 @@ def default_endpoint(config: dict, endpoints: list[dict]) -> dict | None:
     return endpoints[0] if endpoints else None
 
 
+# ── browser profile (CAS sign-in) ────────────────────────────────────────────
+# The sign-in browser can be pinned to a Chrome/Chromium profile. Resolution
+# lives in smc-vpn-open-url (single point of truth); here we pick the spec
+# per endpoint, validate it early via `smc-vpn-open-url --check` and wire the
+# launcher into gpauth with `--browser <launcher>` + env vars.
+
+LAUNCHER_NAME = "smc-vpn-open-url"
+LAUNCHER = os.path.join(os.path.dirname(os.path.realpath(__file__)), LAUNCHER_NAME)
+BROWSER_LABELS = {"chrome": "Chrome", "chromium": "Chromium"}
+
+
+def browser_for(config: dict, eid: str) -> str:
+    """chrome (default) or chromium; per-endpoint override wins."""
+    default = config.get("BROWSER", "chrome").strip().lower() or "chrome"
+    return (config.get(f"ENDPOINT_{eid}_BROWSER", "").strip().lower() or default)
+
+
+def profile_spec_for(config: dict, eid: str) -> str:
+    """Raw profile spec for an endpoint: ENDPOINT_<ID>_BROWSER_PROFILE,
+    else BROWSER_PROFILE, else '' (browser default profile)."""
+    override = config.get(f"ENDPOINT_{eid}_BROWSER_PROFILE", "").strip()
+    if override:
+        return override
+    return config.get("BROWSER_PROFILE", "").strip()
+
+
+def resolve_browser_profile(config: dict, endpoint: dict) -> dict:
+    """Validate the endpoint's browser/profile and return launcher wiring.
+
+    Returns {"launcher": bool, "env": {...}, "label": "Chrome (name)"}.
+    Fails (die) early on an unknown profile so the error surfaces before any
+    sign-in UI starts.
+    """
+    eid = endpoint["id"]
+    browser = browser_for(config, eid)
+    spec = profile_spec_for(config, eid)
+
+    if browser not in ("chrome", "chromium"):
+        # firefox etc.: no profile support here — legacy plain --browser
+        return {"launcher": False, "env": {}, "label": ""}
+
+    if not (os.path.isfile(LAUNCHER) and os.access(LAUNCHER, os.X_OK)):
+        if spec:
+            print(f"    {LAUNCHER_NAME} not found next to this script — "
+                  f"ignoring BROWSER_PROFILE '{spec}'", flush=True)
+        return {"launcher": False, "env": {}, "label": ""}
+
+    env = {"SMC_VPN_BROWSER": browser}
+    label = ""
+    if spec:
+        check = subprocess.run([LAUNCHER, "--check", spec],
+                               capture_output=True, text=True)
+        if check.returncode != 0:
+            die((check.stderr.strip().removeprefix("ERROR: "))
+                or f"Browser profile '{spec}' could not be resolved")
+        try:
+            info = json.loads(check.stdout)
+        except ValueError:
+            die(f"{LAUNCHER_NAME} --check returned no JSON")
+        env["SMC_VPN_BROWSER_PROFILE"] = info["dir"]
+        pname = info.get("name") or info["dir"]
+        label = f"{BROWSER_LABELS.get(browser, browser)} ({pname})"
+    return {"launcher": True, "env": env, "label": label}
+
+
 def active_conn_names() -> set[str]:
     out = subprocess.run(
         ["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"],
@@ -160,6 +366,8 @@ def resolve_endpoint(
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def die(msg: str) -> None:
+    global _error_text
+    _error_text = msg
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -180,7 +388,8 @@ def pump_loop(ms: int = 700) -> None:
 
 # ── step 1 — get cookie ──────────────────────────────────────────────────────
 
-def get_cookie(config: dict, endpoint: dict, browser: str) -> tuple[str, str]:
+def get_cookie(config: dict, endpoint: dict, browser: str,
+               browser_wiring: dict | None = None) -> tuple[str, str]:
     """Run gpclient --cookie-only and return (COOKIE, HOST)."""
     gpclient = config.get("GPCLIENT_BIN",
                           shutil.which("gpclient") or "/usr/bin/gpclient")
@@ -192,6 +401,10 @@ def get_cookie(config: dict, endpoint: dict, browser: str) -> tuple[str, str]:
         "--browser", browser,
         "--cookie-only",
     ]
+    if browser_wiring and browser_wiring.get("launcher"):
+        # Hand the URL to our launcher (which opens the configured browser
+        # profile in its own session) instead of a bare browser name.
+        cmd[cmd.index("--browser") + 1] = LAUNCHER
     if endpoint.get("as_gateway"):
         # Gateway-mode endpoint: CAS accepts the portal login but rejects its
         # result at the gateway ("Gateway login error"), which triggers a
@@ -218,18 +431,43 @@ def get_cookie(config: dict, endpoint: dict, browser: str) -> tuple[str, str]:
     elif gpauth:
         print(f"    gpauth not found at {gpauth} — falling back to system gpauth",
               flush=True)
+    if browser_wiring:
+        env.update(browser_wiring.get("env", {}))
     print(
         f"[1/4] [{endpoint['id']}] Running: {' '.join(cmd)}",
         flush=True,
     )
 
+    global _child
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=300, env=env)
+        # Own session so stray group signals (Ctrl+C, killpg) can't hit the
+        # browser flow; the SIGTERM/SIGINT handler below stops it explicitly.
+        _child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, env=env,
+                                  start_new_session=True)
     except FileNotFoundError:
+        _child = None
         die(f"gpclient not found at {gpclient}")
+
+    returncode = -1
+    try:
+        out, err = _child.communicate(timeout=300)
+        returncode = _child.returncode
     except subprocess.TimeoutExpired:
+        _kill_child_tree()
+        try:
+            _child.communicate(timeout=5)
+        except Exception:
+            try:
+                _child.kill()
+                _child.communicate()
+            except OSError:
+                pass
         die("gpclient timed out after 5 minutes")
+    finally:
+        _child = None
+
+    result = subprocess.CompletedProcess(cmd, returncode, stdout=out, stderr=err)
 
     cookie = host = ""
     for line in result.stdout.splitlines():
@@ -243,7 +481,7 @@ def get_cookie(config: dict, endpoint: dict, browser: str) -> tuple[str, str]:
         die(f"gpclient exited {result.returncode} and returned no cookie")
 
     if not cookie.startswith("authcookie="):
-        die(f"Unexpected cookie format (len={len(cookie)}): {cookie[:60]!r}")
+        die(f"Unexpected cookie format (len={len(cookie)})")
 
     if not host:
         die("gpclient returned no HOST")
@@ -299,18 +537,21 @@ def reconnect(endpoints: list[dict], endpoint: dict) -> None:
             print(f"    bringing down other endpoint '{ep['conn_name']}' …",
                   flush=True)
             subprocess.run(["nmcli", "connection", "down", ep["conn_name"]],
-                           capture_output=True)
+                           capture_output=True, start_new_session=True)
 
-    # Down — ignore errors (connection may already be inactive)
+    # Down — ignore errors (connection may already be inactive).
+    # Own session: a terminal Ctrl+C signals the whole foreground group, and
+    # an interrupted `up` could leave the tunnel down. The refresh itself
+    # ignores the first post-auth SIGINT/SIGTERM (see _on_cancel_signal).
     subprocess.run(
         ["nmcli", "connection", "down", conn_name],
-        capture_output=True,
+        capture_output=True, start_new_session=True,
     )
     time.sleep(1)
 
     up = subprocess.run(
         ["nmcli", "connection", "up", conn_name],
-        capture_output=True, text=True,
+        capture_output=True, text=True, start_new_session=True,
     )
     if up.returncode != 0:
         print(up.stderr, file=sys.stderr)
@@ -380,17 +621,48 @@ def main() -> None:
     if not endpoints:
         die("No endpoints found in config — run install.sh first.")
 
+    existing = _existing_run()
+    if existing is not None:
+        die(f"smc-vpn-refresh is already running (pid {existing.get('pid')}, "
+            f"endpoint {existing.get('endpoint') or '?'}, "
+            f"step {existing.get('step') or '?'}). Wait for it to finish "
+            f"or cancel it first.")
+
     endpoint = resolve_endpoint(config, endpoints, args.endpoint)
-    browser = args.browser or config.get("BROWSER", "chrome")
+    # --browser (CLI) wins over config BROWSER / ENDPOINT_<ID>_BROWSER
+    browser = (args.browser or browser_for(config, endpoint["id"])).strip().lower()
+    wiring = resolve_browser_profile(config, endpoint)
+    if wiring["label"]:
+        print(f"    sign-in browser: {wiring['label']}", flush=True)
+    browser_wiring = wiring if wiring.get("launcher") else None
+    browser_label = wiring.get("label", "")
 
-    cookie, host = get_cookie(config, endpoint, browser)
-    write_nm_secrets(endpoint, cookie, host)
+    _state.update(endpoint=endpoint["id"], connName=endpoint["conn_name"],
+                  browserLabel=browser_label, started=int(time.time()))
+    signal.signal(signal.SIGTERM, _on_cancel_signal)
+    signal.signal(signal.SIGINT, _on_cancel_signal)
 
-    if args.no_connect:
-        print("Secrets updated. Skipping reconnect (--no-connect).", flush=True)
-    else:
-        reconnect(endpoints, endpoint)
-        verify()
+    exit_code = 0
+    try:
+        state_write("auth")
+        cookie, host = get_cookie(config, endpoint, browser, browser_wiring)
+
+        state_write("secrets")
+        write_nm_secrets(endpoint, cookie, host)
+
+        if args.no_connect:
+            print("Secrets updated. Skipping reconnect (--no-connect).", flush=True)
+        else:
+            state_write("connect")
+            reconnect(endpoints, endpoint)
+            state_write("verify")
+            verify()
+    except SystemExit as e:
+        # die() / cancelled — record how the run ended before cleanup
+        exit_code = e.code if isinstance(e.code, int) else 1
+        raise
+    finally:
+        state_clear(last_exit=exit_code)
 
 
 if __name__ == "__main__":

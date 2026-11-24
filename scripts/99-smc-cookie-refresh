@@ -16,6 +16,12 @@ If the portal session has also expired (browser login required), send
 a desktop notification and exit cleanly — the toggle-on will fail and
 the user must run `smc-vpn-refresh` manually.
 
+This script deliberately NEVER opens a browser: it refreshes only from a
+still-valid cookie cache and gives up otherwise. That is why it needs none
+of smc-vpn-refresh's `--browser <smc-vpn-open-url>` / BROWSER_PROFILE
+wiring — a dispatcher-triggered browser login on every disconnect would be
+unwanted.
+
 NM waits for dispatcher scripts on vpn-pre-up/pre-down but NOT on
 vpn-down. This script runs in the background on vpn-down (no-wait
 semantics). That is fine: we only need to finish before the next
