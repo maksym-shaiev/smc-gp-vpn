@@ -219,6 +219,8 @@ The widget shows VPN on/off state in the top bar and opens a popup with
 connection details, public IP / country, and Refresh cookie / Reconnect
 buttons. The global hotkey `Super + Alt + V` opens the popup anywhere.
 
+![Widget popup](https://raw.githubusercontent.com/maksym-shaiev/gp-vpn-omarchy/main/docs/screenshot.png)
+
 If you skipped the prompt, install the widget later with:
 
 ```bash
