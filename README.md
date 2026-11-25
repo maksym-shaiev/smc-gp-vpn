@@ -294,7 +294,9 @@ reusable portal session, so there is nothing to auto-refresh.
 On Omarchy, `install.sh` offers to install the GlobalProtect Omarchy bar widget
 ([gp-vpn-omarchy](https://github.com/maksym-shaiev/gp-vpn-omarchy)) at the end
 of the install. Accepting installs the widget as an Omarchy plugin, enables it
-in the bar and adds the `Super + Alt + V` popup hotkey.
+in the bar and adds the `Super + Alt + V` popup hotkey. Releases are
+versioned together: **smc-gp-vpn v1.0+ pairs with widget v1.2+** (the
+installer always installs the widget's latest `main`).
 
 The widget shows VPN on/off state in the top bar and opens a popup with
 connection details, public IP / country, and Refresh cookie / Reconnect
@@ -343,6 +345,14 @@ bash smc-gp-vpn/install.sh
 
 The installer is idempotent — it overwrites existing files and reconfigures
 the NM profiles cleanly (keeping cookies for migrated profiles).
+
+**What a re-run preserves and what it resets:**
+
+| Kept | Reset |
+|---|---|
+| `~/.config/smc-gp-vpn/config` — endpoints, portals, connection names, browser, browser profiles (only missing `ENDPOINT_<ID>_AS_GATEWAY` keys are appended) | The **gateway cookie stored in the NM profile** — profiles are re-cleaned, so one `smc-vpn-refresh` is needed afterwards (silent for portal-mode endpoints whose cache is still valid, a browser login for gateway-mode ones) |
+| `~/.config/gpclient/smc-cookie-*.json` caches | |
+| NM connection profiles (renamed/cleaned, not deleted) | |
 
 ---
 
@@ -440,6 +450,11 @@ bash <(curl -sL https://raw.githubusercontent.com/maksym-shaiev/gp-vpn-omarchy/m
   runs only when the popup is opened.
 - The dispatcher never opens a browser; it only re-mints cookies from a
   still-valid cache.
+
+## License
+
+Internal use only — Stagwell Marketing Cloud community tooling. Not for
+external distribution.
 
 ---
 

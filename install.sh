@@ -361,6 +361,9 @@ section "Setting up NetworkManager VPN profile"
 python3 "$SCRIPT_DIR/scripts/nm-profile-setup.py" --config "$CONFIG_FILE"
 
 # ── 8. Omarchy bar widget (Omarchy only) ─────────────────────────────────────
+# OMARCHY_WIDGET_URL: tracks the widget's latest main; the installer runs
+# omarchy-plugin-add, which clones the default branch (no tag pinning support
+# there). Compatible with widget v1.2+.
 OMARCHY_WIDGET_URL="https://github.com/maksym-shaiev/gp-vpn-omarchy.git"
 
 IS_OMARCHY=0
