@@ -294,7 +294,7 @@ reusable portal session, so there is nothing to auto-refresh.
 On Omarchy, `install.sh` offers to install the GlobalProtect Omarchy bar widget
 ([gp-vpn-omarchy](https://github.com/maksym-shaiev/gp-vpn-omarchy)) at the end
 of the install. Accepting installs the widget as an Omarchy plugin, enables it
-in the right bar section and adds the `Super + Alt + V` popup hotkey.
+in the bar and adds the `Super + Alt + V` popup hotkey.
 
 The widget shows VPN on/off state in the top bar and opens a popup with
 connection details, public IP / country, and Refresh cookie / Reconnect
