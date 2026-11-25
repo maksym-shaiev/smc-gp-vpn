@@ -71,7 +71,7 @@ fi
 section "Removing binaries"
 
 BIN_DIR="$HOME/.local/bin"
-for bin in gpclient-smc gpauth-smc smc-vpn-refresh; do
+for bin in gpclient-smc gpauth-smc smc-vpn-refresh smc-vpn-open-url; do
     if [[ -f "$BIN_DIR/$bin" ]]; then
         rm -f "$BIN_DIR/$bin"
         info "Removed $BIN_DIR/$bin"
@@ -91,10 +91,23 @@ else
     warn "$CONFIG_DIR does not exist — skipping"
 fi
 
+# Only remove this tool's own cookie files from ~/.config/gpclient — the
+# directory may also hold unrelated gpclient data (e.g. the GUI app's state)
+# that we must not touch.
 GPCLIENT_DIR="$HOME/.config/gpclient"
 if [[ -d "$GPCLIENT_DIR" ]]; then
-    rm -rf "$GPCLIENT_DIR"
-    info "Removed $GPCLIENT_DIR"
+    found=0
+    while IFS= read -r -d '' cookie; do
+        rm -f "$cookie"
+        info "Removed $cookie"
+        found=1
+    done < <(find "$GPCLIENT_DIR" -maxdepth 1 -name 'smc-cookie-*.json' -print0)
+    if [[ $found -eq 1 ]] && [[ -z "$(ls -A "$GPCLIENT_DIR")" ]]; then
+        rmdir "$GPCLIENT_DIR"
+        info "Removed empty $GPCLIENT_DIR"
+    else
+        warn "$GPCLIENT_DIR kept (contains other gpclient data)"
+    fi
 else
     warn "$GPCLIENT_DIR does not exist — skipping"
 fi

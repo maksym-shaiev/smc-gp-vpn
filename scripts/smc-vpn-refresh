@@ -600,7 +600,7 @@ def main() -> None:
     parser.add_argument(
         "--browser",
         default=None,
-        choices=["chrome", "firefox", "auto"],
+        choices=["chrome", "chromium", "firefox", "auto"],
         help="Browser for CAS login when the portal session has expired "
              "(default: value from config, fallback: chrome)",
     )
